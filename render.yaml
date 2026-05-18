@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: social-media-downloader
+    env: docker
+    plan: free
+    autoDeploy: true
