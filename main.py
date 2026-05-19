@@ -69,7 +69,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.0.0"
+    VERSION: str = "6.1.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -189,7 +189,7 @@ prom_dl_seconds = _metric(Histogram, "vs_download_duration_seconds", "Download w
 prom_dl_bytes = _metric(Counter, "vs_download_bytes_total", "Bytes downloaded")
 
 # ═══════════════════════════════════════════════════════════
-# CACHE & STORAGE STORES
+# STORAGE STORES
 # ═══════════════════════════════════════════════════════════
 
 video_info_cache: TTLCache = TTLCache(maxsize=config.CACHE_MAX_SIZE, ttl=config.CACHE_TTL)
@@ -218,14 +218,18 @@ class Job:
     error: Optional[str] = None
     progress: float = 0.0
     speed_bps: Optional[float] = None
-    node_routing: Optional[str] = None
     eta_sec: Optional[int] = None
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     expires_at: Optional[str] = None
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    is_streaming: bool = False
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("cancel_event", None)
+        d.pop("is_streaming", None)
+        return d
 
 
 _job_store: dict[str, Job] = {}
@@ -234,7 +238,7 @@ _download_semaphore: asyncio.Semaphore
 _sse_subscribers: dict[str, set[asyncio.Queue]] = {}
 
 # ═══════════════════════════════════════════════════════════
-# AUTHENTICATION SECURITY SYSTEM
+# SECURITY AUDIT PROTOCOLS
 # ═══════════════════════════════════════════════════════════
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -290,10 +294,13 @@ def validate_url(url: str) -> str:
         raise ValueError(f"Blocked host: {host}")
 
     try:
-        ip_str = socket.gethostbyname(host)
-        ip = ipaddress.ip_address(ip_str)
-        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
-            raise ValueError(f"Private/reserved IP blocked: {ip_str}")
+        # IPv4 aur IPv6 dono checked records compile karne ke liye getaddrinfo use kiya hai
+        addr_info = socket.getaddrinfo(host, None)
+        for res in addr_info:
+            ip_str = res[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
+                raise ValueError(f"Private or reserved IP blocked: {ip_str}")
     except ValueError:
         raise
     except Exception as exc:
@@ -306,7 +313,7 @@ def url_cache_key(url: str) -> str:
     return hashlib.sha256(url.strip().lower().encode()).hexdigest()
 
 # ═══════════════════════════════════════════════════════════
-# DATA FILE ENGINE SYSTEM
+# FILE MANAGER ENGINE
 # ═══════════════════════════════════════════════════════════
 
 
@@ -336,7 +343,7 @@ async def iter_file_range(filepath: Path, start: int, end: int, chunk_size: int 
 
 
 # ═══════════════════════════════════════════════════════════
-# PYDANTIC MODEL SCHEMAS
+# MODEL PARAMETERS
 # ═══════════════════════════════════════════════════════════
 
 
@@ -439,7 +446,7 @@ class JobStatusResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# YT-DLP CORE OPTIMIZATIONS
+# YT-DLP EXTRACTION TOOLS
 # ═══════════════════════════════════════════════════════════
 
 QUALITY_ORDER = {"8K": 0, "4K": 1, "2K": 2, "1080p": 3, "720p": 4, "480p": 5, "360p": 6}
@@ -533,7 +540,7 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
         duration=duration,
         uploader=info.get("uploader", "Unknown"),
         platform=info.get("extractor_key", info.get("extractor", "Web")),
-        formats=_parse_formats(info.get("formats", [])),
+        formats=_parse_formats(info.get("formats", []),),
         webpage_url=url,
         age_limit=info.get("age_limit", 0),
         upload_date=info.get("upload_date"),
@@ -574,7 +581,7 @@ async def _push_progress(job_id: str, data: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════
-# ENGINE CORE DAEMONS
+# ENGINE CORE RUNTIME PIPELINES
 # ═══════════════════════════════════════════════════════════
 
 _shutdown_event = asyncio.Event()
@@ -583,7 +590,7 @@ _shutdown_event = asyncio.Event()
 async def run_download_job(job_id: str) -> None:
     async with _job_store_lock:
         job = _job_store.get(job_id)
-        if not job:
+        if not job or job.status == JobStatus.CANCELLED:
             return
         job.status = JobStatus.PROCESSING
         job.updated_at = datetime.now(UTC).isoformat()
@@ -594,6 +601,10 @@ async def run_download_job(job_id: str) -> None:
     start_time = time.monotonic()
 
     def _progress_hook(d: dict) -> None:
+        # True cancellation hook injected safely into execution fragments
+        if job.cancel_event.is_set():
+            raise yt_dlp.utils.DownloadError("Job force-killed via explicit user cancellation stream.")
+
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes", 0)
@@ -603,6 +614,8 @@ async def run_download_job(job_id: str) -> None:
 
             async def _update() -> None:
                 async with _job_store_lock:
+                    if job.status == JobStatus.CANCELLED:
+                        return
                     job.progress = round(pct, 1)
                     job.speed_bps = speed
                     job.eta_sec = eta
@@ -616,6 +629,11 @@ async def run_download_job(job_id: str) -> None:
                 pass
 
     try:
+        # Disk protection validation checkpoint
+        total_b, used_b, free_b = shutil.disk_usage(config.DOWNLOAD_DIR)
+        if free_b < (config.MAX_FILESIZE_MB * 1024 * 1024):
+            raise OSError("Insufficient system disk space remaining.")
+
         opts = _build_download_opts(job, str(out_dir / "%(title)s.%(ext)s"))
         opts["progress_hooks"] = [_progress_hook]
 
@@ -624,9 +642,12 @@ async def run_download_job(job_id: str) -> None:
                 ydl.extract_info(job.url, download=True)
 
         async with _download_semaphore:
-            if _shutdown_event.is_set():
-                raise asyncio.CancelledError("Server shutting down")
+            if _shutdown_event.is_set() or job.cancel_event.is_set():
+                raise asyncio.CancelledError("Download sequence broken via system cancellation.")
             await asyncio.wait_for(asyncio.to_thread(_blocking_download), timeout=config.DOWNLOAD_TIMEOUT_SEC)
+
+        if job.cancel_event.is_set():
+            raise asyncio.CancelledError("Download sequence broken via system cancellation.")
 
         files = sorted(
             [f for f in out_dir.iterdir() if f.suffix in {".mp4", ".mp3", ".mkv", ".webm", ".m4a", ".opus", ".flac", ".wav"}],
@@ -634,14 +655,14 @@ async def run_download_job(job_id: str) -> None:
             reverse=True,
         )
         if not files:
-            raise FileNotFoundError("yt-dlp core failed tracking storage destination path asset execution sequence.")
+            raise FileNotFoundError("Downloaded file not found")
 
         chosen = files[0]
         file_size = chosen.stat().st_size
         prom_dl_bytes.inc(file_size)
 
         async with _job_store_lock:
-            if job_id in _job_store:
+            if job_id in _job_store and job.status != JobStatus.CANCELLED:
                 job.status = JobStatus.DONE
                 job.filename = str(chosen)
                 job.safe_name = sanitize(chosen.name)
@@ -654,9 +675,16 @@ async def run_download_job(job_id: str) -> None:
         await _push_progress(job_id, {"status": "done", "progress": 100.0})
         await _fire_webhook(job)
 
-    except Exception as exc:
+    except (asyncio.CancelledError, yt_dlp.utils.DownloadError):
         async with _job_store_lock:
             if job_id in _job_store:
+                job.status = JobStatus.CANCELLED
+                job.error = "Job cancelled by request."
+                job.updated_at = datetime.now(UTC).isoformat()
+        cleanup_path(out_dir)
+    except Exception as exc:
+        async with _job_store_lock:
+            if job_id in _job_store and job.status != JobStatus.CANCELLED:
                 job.status = JobStatus.FAILED
                 job.error = str(exc)
                 job.updated_at = datetime.now(UTC).isoformat()
@@ -676,9 +704,11 @@ async def _cleanup_scheduler() -> None:
         async with _job_store_lock:
             expired = [jid for jid, job in _job_store.items() if job.expires_at and datetime.fromisoformat(job.expires_at) < now]
             for jid in expired:
-                job = _job_store.pop(jid)
-                if job.filename:
-                    cleanup_path(Path(job.filename).parent)
+                job = _job_store.get(jid)
+                if job and not job.is_streaming:
+                    _job_store.pop(jid, None)
+                    if job.filename:
+                        cleanup_path(Path(job.filename).parent)
         if expired:
             logger.info(f"Cleaned up {len(expired)} expired execution context paths.")
 
@@ -689,7 +719,7 @@ async def lifespan(app: FastAPI):
     _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
     
     if not shutil.which("ffmpeg"):
-        logger.warning("[self-test] System path variable context error: missing ffmpeg binary executable module environment targets.")
+        logger.warning("[self-test] Missing ffmpeg binary executable module environment targets.")
     
     cleanup_task = asyncio.create_task(_cleanup_scheduler())
     yield
@@ -753,7 +783,14 @@ async def get_info(request: Request, req: VideoInfoRequest, response: Response):
             response.headers["X-Cache"] = "HIT"
             return video_info_cache[key]
 
-    info = await asyncio.to_thread(fetch_video_info_sync, req.url)
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, req.url),
+            timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata extraction query timed out.")
+
     async with cache_lock:
         video_info_cache[key] = info
     response.headers["X-Cache"] = "MISS"
@@ -763,7 +800,13 @@ async def get_info(request: Request, req: VideoInfoRequest, response: Response):
 @app.post("/api/formats", tags=["info"], response_model=list[FormatInfo], dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
 async def get_formats(request: Request, req: VideoInfoRequest):
-    info = await asyncio.to_thread(fetch_video_info_sync, req.url)
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, req.url),
+            timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata extraction query timed out.")
     return info.formats
 
 
@@ -793,23 +836,59 @@ async def download_status(job_id: str):
     )
 
 
+@app.get("/api/download/progress/{job_id}", tags=["download"], dependencies=[_auth])
+async def download_progress_sse(job_id: str, request: Request):
+    async with _job_store_lock:
+        if job_id not in _job_store:
+            raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
+
+    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+    _sse_subscribers.setdefault(job_id, set()).add(q)
+
+    async def _event_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=30)
+                except asyncio.TimeoutError:
+                    yield b": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(data)}\n\n".encode()
+                if data.get("done") or data.get("status") in ("done", "failed", "cancelled"):
+                    break
+        finally:
+            async with _job_store_lock:
+                if job_id in _sse_subscribers:
+                    _sse_subscribers[job_id].discard(q)
+                    if not _sse_subscribers[job_id]:
+                        _sse_subscribers.pop(job_id, None)
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/download/file/{job_id}", tags=["download"], dependencies=[_auth])
 async def get_file(job_id: str, token: str, request: Request):
     verified_job_id = _verify_token(token)
     if verified_job_id != job_id:
-        raise api_error(401, ErrorCode.INVALID_TOKEN, "Token signature identification tracking structural mismatch context error.")
+        raise api_error(401, ErrorCode.INVALID_TOKEN, "Token signature mismatch.")
 
     async with _job_store_lock:
         job_obj = _job_store.get(job_id)
 
     if not job_obj:
-        raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Resource pipeline reference tracking completed.")
+        raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Resource tracking context missing.")
     if job_obj.status != JobStatus.DONE:
-        raise api_error(400, ErrorCode.JOB_STILL_PROCESSING, "Data chunk formatting incomplete at destination path.")
+        raise api_error(400, ErrorCode.JOB_STILL_PROCESSING, "Data chunk formatting incomplete.")
 
     filepath = Path(job_obj.filename) if job_obj.filename else None
     if not filepath or not filepath.is_file():
-        raise api_error(404, ErrorCode.FILE_MISSING, "Physical storage hardware allocation target tracking resource context missing.")
+        raise api_error(404, ErrorCode.FILE_MISSING, "Downloaded file not found")
 
     file_size = filepath.stat().st_size
     media_type = f"audio/{job_obj.audio_format}" if job_obj.is_audio else mimetypes.guess_type(str(filepath))[0] or "video/mp4"
@@ -833,18 +912,23 @@ async def get_file(job_id: str, token: str, request: Request):
         "Content-Range": f"bytes {start}-{end}/{file_size}" if is_partial else f"bytes 0-{end}/{file_size}",
     }
 
-    # Safe Cleanup System: Isolate and drop job context only AFTER data chunk stream pipeline natively finishes execution
+    async with _job_store_lock:
+        job_obj.is_streaming = True
+
     async def purge_resource_after_streaming():
         async with _job_store_lock:
             _job_store.pop(job_id, None)
         cleanup_path(filepath.parent)
+
+    bg = BackgroundTasks()
+    bg.add_task(purge_resource_after_streaming)
 
     return StreamingResponse(
         iter_file_range(filepath, start, end),
         status_code=206 if is_partial else 200,
         media_type=media_type,
         headers=headers,
-        background=BackgroundTasks().add_task(purge_resource_after_streaming)
+        background=bg
     )
 
 
@@ -853,13 +937,22 @@ async def cancel_job(job_id: str):
     async with _job_store_lock:
         job = _job_store.get(job_id)
         if not job:
-            raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job context sequence missing.")
+            raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job missing.")
+        
+        job.cancel_event.set()
         job.status = JobStatus.CANCELLED
+        
     cleanup_path(config.DOWNLOAD_DIR / job_id)
     async with _job_store_lock:
         _job_store.pop(job_id, None)
-    return {"message": f"Job framework instantiation sequence context [{job_id}] broken down correctly."}
+    return {"message": f"Job [{job_id}] cancelled correctly."}
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=config.PORT, reload=config.DEBUG, workers=1)
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=config.PORT, 
+        reload=config.DEBUG, 
+        workers=config.WORKERS
+    )
