@@ -30,6 +30,7 @@ from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
+    Query,
     Request,
     Response,
     Security,
@@ -69,7 +70,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.1.5"
+    VERSION: str = "6.3.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -499,7 +500,7 @@ class JobStatusResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# YT-DLP
+# YT-DLP (ANTI-BOT STRATEGIES IMPLEMENTED)
 # ═══════════════════════════════════════════════════════════
 
 QUALITY_ORDER = {
@@ -521,8 +522,17 @@ _YDL_COMMON: dict[str, Any] = {
     "retries": config.MAX_RETRIES,
     "restrictfilenames": True,
     "trim_file_name": 200,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+            "player_skip": ["configs"],
+        }
+    },
+    "sleep_interval_requests": 1,
+    "sleep_interval": 1,
+    "max_sleep_interval": 3,
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (compatible; VideoSnap/6.0)"
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
     },
     **({"cookiefile": config.COOKIES_FILE} if config.COOKIES_FILE else {}),
     **({"proxy": config.HTTP_PROXY} if config.HTTP_PROXY else {}),
@@ -896,10 +906,15 @@ async def get_info(
 @limiter.limit(config.RATE_LIMIT_INFO)
 async def get_info_browser(
     request: Request,
-    url: str,
-    response: Response,
+    url: str = Query(..., min_length=10, max_length=2048),
+    response: Response = None,
 ):
-    key = url_cache_key(url)
+    try:
+        clean_url = validate_url(url)
+    except ValueError as exc:
+        raise api_error(400, ErrorCode.INVALID_URL, str(exc))
+
+    key = url_cache_key(clean_url)
     async with cache_lock:
         if key in video_info_cache:
             prom_cache_hits.inc()
@@ -908,7 +923,7 @@ async def get_info_browser(
 
     try:
         info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_video_info_sync, url), timeout=15.0
+            asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=15.0
         )
     except asyncio.TimeoutError:
         raise api_error(
@@ -999,7 +1014,6 @@ async def download_status(job_id: str):
         error=job.error,
         progress=job.progress,
         speed_bps=job.speed_bps,
-        node_routing=None,
         eta_sec=job.eta_sec,
         download_token=token,
         created_at=job.created_at,
@@ -1061,8 +1075,10 @@ async def get_file(
         "Content-Disposition": f'attachment; filename="{job_obj.safe_name}"',
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
-        "Content-Range": f"bytes {start}-{end}/{file_size}",
     }
+
+    if is_partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
     async with _job_store_lock:
         job_obj.is_streaming = True
