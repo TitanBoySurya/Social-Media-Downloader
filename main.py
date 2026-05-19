@@ -69,7 +69,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.0.1"
+    VERSION: str = "6.1.5"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -114,9 +114,7 @@ class Config:
         os.getenv("WEBHOOK_TIMEOUT_SEC", "10")
     )
 
-    ALLOWED_PLATFORMS: set[str] = set(
-        _env_list("ALLOWED_PLATFORMS", "")
-    )
+    ALLOWED_PLATFORMS: set[str] = set(_env_list("ALLOWED_PLATFORMS", ""))
 
     BLOCKED_HOSTS: frozenset[str] = frozenset(
         {
@@ -129,9 +127,7 @@ class Config:
         }
     )
 
-    CHUNK_SIZE: int = int(
-        os.getenv("CHUNK_SIZE", str(64 * 1024))
-    )
+    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", str(64 * 1024)))
 
 
 config = Config()
@@ -146,7 +142,6 @@ logging.basicConfig(
     format='{"ts":"%(asctime)s","lvl":"%(levelname)s","logger":"%(name)s","msg":%(message)r}',
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
-
 logger = logging.getLogger("videosnap")
 
 # ═══════════════════════════════════════════════════════════
@@ -199,56 +194,25 @@ def api_error(
 
 def _metric(cls, name, doc, labels=None):
     existing = REGISTRY._names_to_collectors.get(name)
-
     if existing:
         return existing
-
     return cls(name, doc, labels) if labels else cls(name, doc)
 
 
 prom_requests = _metric(
-    Counter,
-    "vs_requests_total",
-    "Total API requests",
-    ["endpoint"],
+    Counter, "vs_requests_total", "Total API requests", ["endpoint"]
 )
-
 prom_downloads = _metric(
-    Counter,
-    "vs_downloads_total",
-    "Completed downloads",
-    ["type"],
+    Counter, "vs_downloads_total", "Completed downloads", ["type"]
 )
-
-prom_errors = _metric(
-    Counter,
-    "vs_errors_total",
-    "Errors",
-    ["code"],
-)
-
-prom_cache_hits = _metric(
-    Counter,
-    "vs_cache_hits_total",
-    "Info cache hits",
-)
-
-prom_active_jobs = _metric(
-    Gauge,
-    "vs_active_jobs",
-    "Active download jobs",
-)
-
+prom_errors = _metric(Counter, "vs_errors_total", "Errors", ["code"])
+prom_cache_hits = _metric(Counter, "vs_cache_hits_total", "Info cache hits")
+prom_active_jobs = _metric(Gauge, "vs_active_jobs", "Active download jobs")
 prom_dl_seconds = _metric(
-    Histogram,
-    "vs_download_duration_seconds",
-    "Download wall time",
+    Histogram, "vs_download_duration_seconds", "Download wall time"
 )
-
 prom_dl_bytes = _metric(
-    Counter,
-    "vs_download_bytes_total",
-    "Bytes downloaded",
+    Counter, "vs_download_bytes_total", "Bytes downloaded"
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -259,7 +223,6 @@ video_info_cache: TTLCache = TTLCache(
     maxsize=config.CACHE_MAX_SIZE,
     ttl=config.CACHE_TTL,
 )
-
 cache_lock = asyncio.Lock()
 
 
@@ -289,39 +252,34 @@ class Job:
     progress: float = 0.0
     speed_bps: Optional[float] = None
     eta_sec: Optional[int] = None
+    is_streaming: bool = False
 
     created_at: str = field(
         default_factory=lambda: datetime.now(UTC).isoformat()
     )
-
     updated_at: str = field(
         default_factory=lambda: datetime.now(UTC).isoformat()
     )
-
     expires_at: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("is_streaming", None)
+        return d
 
 
 _job_store: dict[str, Job] = {}
 _job_store_lock = asyncio.Lock()
 
 _download_semaphore: asyncio.Semaphore
-
 _running_tasks: dict[str, asyncio.Task] = {}
-
 _shutdown_event = asyncio.Event()
 
 # ═══════════════════════════════════════════════════════════
 # AUTH
 # ═══════════════════════════════════════════════════════════
 
-_api_key_header = APIKeyHeader(
-    name="X-API-Key",
-    auto_error=False,
-)
-
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 limiter = Limiter(key_func=get_remote_address)
 
 
@@ -331,14 +289,8 @@ async def require_api_key(
     if not config.API_KEY:
         return
 
-    if not api_key or not secrets.compare_digest(
-        api_key,
-        config.API_KEY,
-    ):
-        prom_errors.labels(
-            code=ErrorCode.UNAUTHORIZED
-        ).inc()
-
+    if not api_key or not secrets.compare_digest(api_key, config.API_KEY):
+        prom_errors.labels(code=ErrorCode.UNAUTHORIZED).inc()
         raise HTTPException(
             status_code=401,
             detail={
@@ -350,60 +302,37 @@ async def require_api_key(
 
 def _make_token(job_id: str) -> str:
     expires = int(time.time()) + config.TOKEN_TTL_SEC
-
     payload = f"{job_id}.{expires}"
-
     sig = hmac.new(
-        config.TOKEN_SECRET.encode(),
-        payload.encode(),
-        hashlib.sha256,
+        config.TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256
     ).hexdigest()
-
     return f"{payload}.{sig}"
 
 
 def _verify_token(token: str) -> str:
     try:
         parts = token.split(".")
-
         if len(parts) != 3:
             raise ValueError
 
         job_id, expires_str, sig = parts
-
         payload = f"{job_id}.{expires_str}"
 
         expected = hmac.new(
-            config.TOKEN_SECRET.encode(),
-            payload.encode(),
-            hashlib.sha256,
+            config.TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256
         ).hexdigest()
 
         if not hmac.compare_digest(sig, expected):
-            raise api_error(
-                401,
-                ErrorCode.INVALID_TOKEN,
-                "Invalid token",
-            )
+            raise api_error(401, ErrorCode.INVALID_TOKEN, "Invalid token")
 
         if int(time.time()) > int(expires_str):
-            raise api_error(
-                401,
-                ErrorCode.TOKEN_EXPIRED,
-                "Token expired",
-            )
+            raise api_error(401, ErrorCode.TOKEN_EXPIRED, "Token expired")
 
         return job_id
-
     except HTTPException:
         raise
-
     except Exception:
-        raise api_error(
-            401,
-            ErrorCode.INVALID_TOKEN,
-            "Malformed token",
-        )
+        raise api_error(401, ErrorCode.INVALID_TOKEN, "Malformed token")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -413,47 +342,35 @@ def _verify_token(token: str) -> str:
 
 def validate_url(url: str) -> str:
     parsed = urlparse(url)
-
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(
-            "Only HTTP/HTTPS URLs are allowed"
-        )
+        raise ValueError("Only HTTP/HTTPS URLs are allowed")
 
     host = (parsed.hostname or "").lower().rstrip(".")
-
     if host in config.BLOCKED_HOSTS:
         raise ValueError(f"Blocked host: {host}")
 
     try:
-        ip_str = socket.gethostbyname(host)
-
-        ip = ipaddress.ip_address(ip_str)
-
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_reserved
-            or ip.is_link_local
-        ):
-            raise ValueError(
-                f"Private/reserved IP blocked: {ip_str}"
-            )
-
+        addr_info = socket.getaddrinfo(host, None)
+        for res in addr_info:
+            ip_str = res[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_reserved
+                or ip.is_link_local
+            ):
+                raise ValueError(f"Private/reserved IP blocked: {ip_str}")
     except ValueError:
         raise
-
     except Exception as exc:
-        raise ValueError(
-            f"Host resolution failed: {exc}"
-        ) from exc
+        raise ValueError(f"Host resolution failed: {exc}") from exc
 
     return url
 
 
 def url_cache_key(url: str) -> str:
-    return hashlib.sha256(
-        url.strip().lower().encode()
-    ).hexdigest()
+    return hashlib.sha256(url.strip().lower().encode()).hexdigest()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -464,17 +381,12 @@ def url_cache_key(url: str) -> str:
 def cleanup_path(path: str | Path) -> None:
     try:
         p = Path(path)
-
         if p.is_dir():
             shutil.rmtree(p, ignore_errors=True)
-
         elif p.is_file():
             p.unlink(missing_ok=True)
-
     except Exception as exc:
-        logger.warning(
-            f"Cleanup failed for {path}: {exc}"
-        )
+        logger.warning(f"Cleanup failed for {path}: {exc}")
 
 
 async def iter_file_range(
@@ -483,28 +395,17 @@ async def iter_file_range(
     end: int,
     chunk_size: int = config.CHUNK_SIZE,
 ) -> AsyncGenerator[bytes, None]:
-
     loop = asyncio.get_running_loop()
-
     remaining = end - start + 1
 
     with filepath.open("rb") as fh:
         fh.seek(start)
-
         while remaining > 0:
             to_read = min(chunk_size, remaining)
-
-            chunk = await loop.run_in_executor(
-                None,
-                fh.read,
-                to_read,
-            )
-
+            chunk = await loop.run_in_executor(None, fh.read, to_read)
             if not chunk:
                 break
-
             remaining -= len(chunk)
-
             yield chunk
 
 
@@ -522,15 +423,8 @@ class AudioFormat(str, Enum):
 
 
 class VideoInfoRequest(BaseModel):
-    model_config = ConfigDict(
-        str_strip_whitespace=True
-    )
-
-    url: str = Field(
-        ...,
-        min_length=10,
-        max_length=2048,
-    )
+    model_config = ConfigDict(str_strip_whitespace=True)
+    url: str = Field(..., min_length=10, max_length=2048)
 
     @field_validator("url")
     @classmethod
@@ -539,29 +433,12 @@ class VideoInfoRequest(BaseModel):
 
 
 class DownloadRequest(BaseModel):
-    model_config = ConfigDict(
-        str_strip_whitespace=True
-    )
-
-    url: str = Field(
-        ...,
-        min_length=10,
-        max_length=2048,
-    )
-
-    format_id: str = Field(
-        default="",
-        max_length=64,
-    )
-
+    model_config = ConfigDict(str_strip_whitespace=True)
+    url: str = Field(..., min_length=10, max_length=2048)
+    format_id: str = Field(default="", max_length=64)
     is_audio: bool = False
-
     audio_format: AudioFormat = AudioFormat.mp3
-
-    webhook_url: str = Field(
-        default="",
-        max_length=2048,
-    )
+    webhook_url: str = Field(default="", max_length=2048)
 
     @field_validator("url")
     @classmethod
@@ -573,7 +450,6 @@ class DownloadRequest(BaseModel):
     def _validate_webhook(cls, v: str) -> str:
         if not v:
             return v
-
         return validate_url(v)
 
 
@@ -594,7 +470,7 @@ class FormatInfo(BaseModel):
 class VideoInfo(BaseModel):
     title: str
     thumbnail: str
-    duration: int
+    duration: Optional[int] = 0
     uploader: str
     platform: str
     formats: list[FormatInfo]
@@ -611,17 +487,12 @@ class JobResponse(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     status: JobStatus
-
     filename: Optional[str] = None
     error: Optional[str] = None
-
     progress: float = 0.0
-
     speed_bps: Optional[float] = None
     eta_sec: Optional[int] = None
-
     download_token: Optional[str] = None
-
     created_at: str
     updated_at: str
     expires_at: Optional[str] = None
@@ -651,21 +522,10 @@ _YDL_COMMON: dict[str, Any] = {
     "restrictfilenames": True,
     "trim_file_name": 200,
     "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 "
-            "(compatible; VideoSnap/6.0)"
-        )
+        "User-Agent": "Mozilla/5.0 (compatible; VideoSnap/6.0)"
     },
-    **(
-        {"cookiefile": config.COOKIES_FILE}
-        if config.COOKIES_FILE
-        else {}
-    ),
-    **(
-        {"proxy": config.HTTP_PROXY}
-        if config.HTTP_PROXY
-        else {}
-    ),
+    **({"cookiefile": config.COOKIES_FILE} if config.COOKIES_FILE else {}),
+    **({"proxy": config.HTTP_PROXY} if config.HTTP_PROXY else {}),
 }
 
 
@@ -673,17 +533,12 @@ def _build_download_opts(
     job: Job,
     output_template: str,
 ) -> dict[str, Any]:
-
     base: dict[str, Any] = {
         **_YDL_COMMON,
         "outtmpl": output_template,
         "overwrites": True,
         "concurrent_fragment_downloads": config.CONCURRENT_FRAGS,
-        "max_filesize": (
-            config.MAX_FILESIZE_MB
-            * 1024
-            * 1024
-        ),
+        "max_filesize": config.MAX_FILESIZE_MB * 1024 * 1024,
     }
 
     if job.is_audio:
@@ -710,32 +565,21 @@ def _build_download_opts(
     }
 
 
-def _parse_formats(
-    raw_formats: list[dict],
-) -> list[FormatInfo]:
-
+def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
     out: list[FormatInfo] = []
-
     for fmt in raw_formats:
         height = fmt.get("height")
-
         vcodec = fmt.get("vcodec", "none")
-
         if vcodec == "none" or not height:
             continue
 
         out.append(
             FormatInfo(
-                format_id=fmt.get(
-                    "format_id",
-                    "",
-                ),
+                format_id=fmt.get("format_id", ""),
                 quality=f"{height}p",
                 ext=fmt.get("ext", "mp4"),
                 filesize=fmt.get("filesize"),
-                filesize_approx=fmt.get(
-                    "filesize_approx"
-                ),
+                filesize_approx=fmt.get("filesize_approx"),
                 is_audio=False,
                 resolution=f'{fmt.get("width")}x{height}',
                 fps=fmt.get("fps"),
@@ -744,65 +588,30 @@ def _parse_formats(
                 acodec=fmt.get("acodec"),
             )
         )
-
-    out.sort(
-        key=lambda x: QUALITY_ORDER.get(
-            x.quality,
-            999,
-        )
-    )
-
+    out.sort(key=lambda x: QUALITY_ORDER.get(x.quality, 999))
     return out
 
 
-def fetch_video_info_sync(
-    url: str,
-) -> VideoInfo:
-
+def fetch_video_info_sync(url: str) -> VideoInfo:
     try:
-        with yt_dlp.YoutubeDL(
-            {
-                **_YDL_COMMON,
-                "skip_download": True,
-            }
-        ) as ydl:
-
-            info = ydl.extract_info(
-                url,
-                download=False,
-            )
-
+        with yt_dlp.YoutubeDL({**_YDL_COMMON, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
     except Exception as exc:
         raise api_error(
-            400,
-            ErrorCode.FETCH_FAILED,
-            f"Could not fetch info: {exc}",
+            400, ErrorCode.FETCH_FAILED, f"Could not fetch info: {exc}"
         )
 
     duration = info.get("duration") or 0
-
     if duration > config.MAX_DURATION_SEC:
-        raise api_error(
-            400,
-            ErrorCode.DURATION_EXCEEDED,
-            "Video too long",
-        )
+        raise api_error(400, ErrorCode.DURATION_EXCEEDED, "Video too long")
 
     return VideoInfo(
         title=info.get("title", "Unknown"),
         thumbnail=info.get("thumbnail", ""),
         duration=duration,
-        uploader=info.get(
-            "uploader",
-            "Unknown",
-        ),
-        platform=info.get(
-            "extractor_key",
-            "Web",
-        ),
-        formats=_parse_formats(
-            info.get("formats", [])
-        ),
+        uploader=info.get("uploader", "Unknown"),
+        platform=info.get("extractor_key", "Web"),
+        formats=_parse_formats(info.get("formats", [])),
         webpage_url=url,
     )
 
@@ -815,24 +624,14 @@ def fetch_video_info_sync(
 async def run_download_job(job_id: str) -> None:
     async with _job_store_lock:
         job = _job_store.get(job_id)
-
         if not job:
             return
-
         job.status = JobStatus.PROCESSING
-        job.updated_at = datetime.now(
-            UTC
-        ).isoformat()
+        job.updated_at = datetime.now(UTC).isoformat()
 
     prom_active_jobs.inc()
-
     out_dir = config.DOWNLOAD_DIR / job_id
-
-    out_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    out_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.monotonic()
 
     def _progress_hook(d: dict) -> None:
@@ -840,21 +639,10 @@ async def run_download_job(job_id: str) -> None:
             return
 
         total = (
-            d.get("total_bytes")
-            or d.get("total_bytes_estimate")
-            or 0
+            d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         )
-
-        downloaded = d.get(
-            "downloaded_bytes",
-            0,
-        )
-
-        pct = (
-            downloaded / total * 100
-            if total
-            else 0.0
-        )
+        downloaded = d.get("downloaded_bytes", 0)
+        pct = downloaded / total * 100 if total else 0.0
 
         speed = d.get("speed")
         eta = d.get("eta")
@@ -863,46 +651,35 @@ async def run_download_job(job_id: str) -> None:
             async with _job_store_lock:
                 if job_id not in _job_store:
                     return
-
                 job.progress = round(pct, 1)
                 job.speed_bps = speed
                 job.eta_sec = eta
-                job.updated_at = datetime.now(
-                    UTC
-                ).isoformat()
+                job.updated_at = datetime.now(UTC).isoformat()
 
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(_update())
-
         except RuntimeError:
             pass
 
     try:
-        opts = _build_download_opts(
-            job,
-            str(out_dir / "%(title)s.%(ext)s"),
-        )
+        total_b, used_b, free_b = shutil.disk_usage(config.DOWNLOAD_DIR)
+        if free_b < (config.MAX_FILESIZE_MB * 1024 * 1024):
+            raise OSError("Insufficient system disk space remaining.")
 
-        opts["progress_hooks"] = [
-            _progress_hook
-        ]
+        opts = _build_download_opts(job, str(out_dir / "%(title)s.%(ext)s"))
+        opts["progress_hooks"] = [_progress_hook]
 
         def _blocking_download():
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(
-                    job.url,
-                    download=True,
-                )
+                ydl.extract_info(job.url, download=True)
 
         async with _download_semaphore:
             if _shutdown_event.is_set():
                 raise asyncio.CancelledError()
 
             await asyncio.wait_for(
-                asyncio.to_thread(
-                    _blocking_download
-                ),
+                asyncio.to_thread(_blocking_download),
                 timeout=config.DOWNLOAD_TIMEOUT_SEC,
             )
 
@@ -927,56 +704,31 @@ async def run_download_job(job_id: str) -> None:
         )
 
         if not files:
-            raise FileNotFoundError(
-                "Download failed"
-            )
+            raise FileNotFoundError("Downloaded file not found")
 
         chosen = files[0]
-
-        prom_dl_bytes.inc(
-            chosen.stat().st_size
-        )
+        prom_dl_bytes.inc(chosen.stat().st_size)
 
         async with _job_store_lock:
             if job_id not in _job_store:
                 return
-
             job.status = JobStatus.DONE
             job.filename = str(chosen)
-            job.safe_name = sanitize(
-                chosen.name
-            )
+            job.safe_name = sanitize(chosen.name)
             job.progress = 100.0
-
-            job.updated_at = datetime.now(
-                UTC
-            ).isoformat()
-
+            job.updated_at = datetime.now(UTC).isoformat()
             job.expires_at = (
-                datetime.now(UTC)
-                + timedelta(
-                    seconds=config.JOB_TTL_SEC
-                )
+                datetime.now(UTC) + timedelta(seconds=config.JOB_TTL_SEC)
             ).isoformat()
 
-        prom_downloads.labels(
-            type=(
-                "audio"
-                if job.is_audio
-                else "video"
-            )
-        ).inc()
-
-        prom_dl_seconds.observe(
-            time.monotonic() - start_time
-        )
+        prom_downloads.labels(type="audio" if job.is_audio else "video").inc()
+        prom_dl_seconds.observe(time.monotonic() - start_time)
 
     except asyncio.CancelledError:
         async with _job_store_lock:
             if job_id in _job_store:
                 job.status = JobStatus.CANCELLED
-                job.error = "Download cancelled"
-
+                job.error = "Job cancelled by request."
         cleanup_path(out_dir)
 
     except Exception as exc:
@@ -984,12 +736,8 @@ async def run_download_job(job_id: str) -> None:
             if job_id in _job_store:
                 job.status = JobStatus.FAILED
                 job.error = str(exc)
-
         cleanup_path(out_dir)
-
-        prom_errors.labels(
-            code=ErrorCode.INTERNAL_ERROR
-        ).inc()
+        prom_errors.labels(code=ErrorCode.INTERNAL_ERROR).inc()
 
     finally:
         prom_active_jobs.dec()
@@ -1003,10 +751,7 @@ async def run_download_job(job_id: str) -> None:
 
 async def _cleanup_scheduler():
     while not _shutdown_event.is_set():
-        await asyncio.sleep(
-            config.CLEANUP_INTERVAL
-        )
-
+        await asyncio.sleep(config.CLEANUP_INTERVAL)
         now = datetime.now(UTC)
 
         async with _job_store_lock:
@@ -1014,47 +759,31 @@ async def _cleanup_scheduler():
                 jid
                 for jid, job in _job_store.items()
                 if job.expires_at
-                and datetime.fromisoformat(
-                    job.expires_at
-                )
-                < now
+                and datetime.fromisoformat(job.expires_at) < now
             ]
 
             for jid in expired:
-                job = _job_store.pop(jid)
-
-                if job.filename:
-                    cleanup_path(
-                        Path(job.filename).parent
-                    )
+                job = _job_store.get(jid)
+                if job and not job.is_streaming:
+                    _job_store.pop(jid, None)
+                    if job.filename:
+                        cleanup_path(Path(job.filename).parent)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _download_semaphore
-
-    _download_semaphore = asyncio.Semaphore(
-        config.MAX_CONCURRENT_DOWNLOADS
-    )
+    _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
 
     if not shutil.which("ffmpeg"):
-        logger.warning(
-            "ffmpeg not found"
-        )
+        logger.warning("Missing ffmpeg binary executable module environment targets.")
 
-    cleanup_task = asyncio.create_task(
-        _cleanup_scheduler()
-    )
-
+    cleanup_task = asyncio.create_task(_cleanup_scheduler())
     yield
-
     _shutdown_event.set()
-
     cleanup_task.cancel()
 
-    for task in list(
-        _running_tasks.values()
-    ):
+    for task in list(_running_tasks.values()):
         task.cancel()
 
 
@@ -1067,27 +796,15 @@ app = FastAPI(
     version=config.VERSION,
     lifespan=lifespan,
 )
-
 app.state.limiter = limiter
 
-_has_wildcard = (
-    "*" in config.ALLOWED_ORIGINS
-)
-
+_has_wildcard = "*" in config.ALLOWED_ORIGINS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=not _has_wildcard,
-    allow_methods=[
-        "GET",
-        "POST",
-        "DELETE",
-    ],
-    allow_headers=[
-        "X-API-Key",
-        "Content-Type",
-        "Range",
-    ],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["X-API-Key", "Content-Type", "Range"],
     expose_headers=[
         "Content-Disposition",
         "Content-Range",
@@ -1098,33 +815,16 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def request_id_middleware(
-    request: Request,
-    call_next,
-):
-    prom_requests.labels(
-        endpoint=request.url.path
-    ).inc()
-
-    rid = (
-        request.headers.get("X-Request-ID")
-        or str(uuid.uuid4())
-    )
-
+async def request_id_middleware(request: Request, call_next):
+    prom_requests.labels(endpoint=request.url.path).inc()
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     response = await call_next(request)
-
     response.headers["X-Request-ID"] = rid
-
     return response
 
 
-@app.exception_handler(
-    RateLimitExceeded
-)
-async def rate_limit_handler(
-    request: Request,
-    exc: RateLimitExceeded,
-):
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
         content={
@@ -1146,16 +846,11 @@ async def health():
     return {
         "status": "healthy",
         "version": config.VERSION,
-        "timestamp": datetime.now(
-            UTC
-        ).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 
-@app.get(
-    "/metrics",
-    include_in_schema=False,
-)
+@app.get("/metrics", include_in_schema=False)
 async def metrics():
     return StreamingResponse(
         iter([generate_latest()]),
@@ -1175,25 +870,55 @@ async def get_info(
     response: Response,
 ):
     key = url_cache_key(req.url)
-
     async with cache_lock:
         if key in video_info_cache:
             prom_cache_hits.inc()
-
             response.headers["X-Cache"] = "HIT"
-
             return video_info_cache[key]
 
-    info = await asyncio.to_thread(
-        fetch_video_info_sync,
-        req.url,
-    )
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        raise api_error(
+            408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out."
+        )
 
     async with cache_lock:
         video_info_cache[key] = info
 
     response.headers["X-Cache"] = "MISS"
+    return info
 
+
+@app.get("/api/info", response_model=VideoInfo, dependencies=[_auth])
+@limiter.limit(config.RATE_LIMIT_INFO)
+async def get_info_browser(
+    request: Request,
+    url: str,
+    response: Response,
+):
+    key = url_cache_key(url)
+    async with cache_lock:
+        if key in video_info_cache:
+            prom_cache_hits.inc()
+            response.headers["X-Cache"] = "HIT"
+            return video_info_cache[key]
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, url), timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        raise api_error(
+            408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out."
+        )
+
+    async with cache_lock:
+        video_info_cache[key] = info
+
+    response.headers["X-Cache"] = "MISS"
     return info
 
 
@@ -1207,11 +932,14 @@ async def get_formats(
     request: Request,
     req: VideoInfoRequest,
 ):
-    info = await asyncio.to_thread(
-        fetch_video_info_sync,
-        req.url,
-    )
-
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        raise api_error(
+            408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out."
+        )
     return info.formats
 
 
@@ -1227,7 +955,6 @@ async def start_download(
     req: DownloadRequest,
 ):
     job_id = str(uuid.uuid4())
-
     job = Job(
         job_id=job_id,
         url=req.url,
@@ -1240,10 +967,7 @@ async def start_download(
     async with _job_store_lock:
         _job_store[job_id] = job
 
-    task = asyncio.create_task(
-        run_download_job(job_id)
-    )
-
+    task = asyncio.create_task(run_download_job(job_id))
     _running_tasks[job_id] = task
 
     return JobResponse(
@@ -1264,17 +988,9 @@ async def download_status(job_id: str):
         job = _job_store.get(job_id)
 
     if not job:
-        raise api_error(
-            404,
-            ErrorCode.JOB_NOT_FOUND,
-            "Job not found",
-        )
+        raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
 
-    token = (
-        _make_token(job_id)
-        if job.status == JobStatus.DONE
-        else None
-    )
+    token = _make_token(job_id) if job.status == JobStatus.DONE else None
 
     return JobStatusResponse(
         job_id=job_id,
@@ -1283,6 +999,7 @@ async def download_status(job_id: str):
         error=job.error,
         progress=job.progress,
         speed_bps=job.speed_bps,
+        node_routing=None,
         eta_sec=job.eta_sec,
         download_token=token,
         created_at=job.created_at,
@@ -1291,179 +1008,95 @@ async def download_status(job_id: str):
     )
 
 
-@app.get(
-    "/api/download/file/{job_id}",
-    dependencies=[_auth],
-)
+@app.get("/api/download/file/{job_id}", dependencies=[_auth])
 async def get_file(
     job_id: str,
     token: str,
     request: Request,
 ):
-    verified_job_id = _verify_token(
-        token
-    )
-
+    verified_job_id = _verify_token(token)
     if verified_job_id != job_id:
-        raise api_error(
-            401,
-            ErrorCode.INVALID_TOKEN,
-            "Invalid token",
-        )
+        raise api_error(401, ErrorCode.INVALID_TOKEN, "Invalid token")
 
     async with _job_store_lock:
         job_obj = _job_store.get(job_id)
 
     if not job_obj:
-        raise api_error(
-            404,
-            ErrorCode.JOB_NOT_FOUND,
-            "Job not found",
-        )
+        raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
 
     if job_obj.status != JobStatus.DONE:
         raise api_error(
-            400,
-            ErrorCode.JOB_STILL_PROCESSING,
-            "Job still processing",
+            400, ErrorCode.JOB_STILL_PROCESSING, "Job still processing"
         )
 
-    filepath = (
-        Path(job_obj.filename)
-        if job_obj.filename
-        else None
-    )
-
+    filepath = Path(job_obj.filename) if job_obj.filename else None
     if not filepath or not filepath.is_file():
-        raise api_error(
-            404,
-            ErrorCode.FILE_MISSING,
-            "File missing",
-        )
+        raise api_error(404, ErrorCode.FILE_MISSING, "File missing")
 
     file_size = filepath.stat().st_size
-
     media_type = (
         f"audio/{job_obj.audio_format}"
         if job_obj.is_audio
-        else (
-            mimetypes.guess_type(
-                str(filepath)
-            )[0]
-            or "video/mp4"
-        )
+        else (mimetypes.guess_type(str(filepath))[0] or "video/mp4")
     )
 
-    range_header = request.headers.get(
-        "Range"
-    )
-
+    range_header = request.headers.get("Range")
     start = 0
     end = file_size - 1
 
     if range_header:
-        match = re.match(
-            r"bytes=(\d+)-(\d*)",
-            range_header,
-        )
-
+        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
         if match:
             start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else file_size - 1
+            end = min(end, file_size - 1)
 
-            end = (
-                int(match.group(2))
-                if match.group(2)
-                else file_size - 1
-            )
-
-            end = min(
-                end,
-                file_size - 1,
-            )
-
-            if (
-                start >= file_size
-                or start > end
-            ):
-                raise HTTPException(
-                    status_code=416,
-                    detail="Invalid range",
-                )
+            if start >= file_size or start > end:
+                raise HTTPException(status_code=416, detail="Invalid range")
 
     content_length = end - start + 1
-
-    is_partial = (
-        start > 0
-        or end < file_size - 1
-    )
+    is_partial = start > 0 or end < file_size - 1
 
     headers = {
-        "Content-Disposition": (
-            f'attachment; filename="{job_obj.safe_name}"'
-        ),
+        "Content-Disposition": f'attachment; filename="{job_obj.safe_name}"',
         "Accept-Ranges": "bytes",
-        "Content-Length": str(
-            content_length
-        ),
-        "Content-Range": (
-            f"bytes {start}-{end}/{file_size}"
-        ),
+        "Content-Length": str(content_length),
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
     }
+
+    async with _job_store_lock:
+        job_obj.is_streaming = True
 
     async def purge_after_stream():
         async with _job_store_lock:
             _job_store.pop(job_id, None)
-
         cleanup_path(filepath.parent)
 
     return StreamingResponse(
-        iter_file_range(
-            filepath,
-            start,
-            end,
-        ),
+        iter_file_range(filepath, start, end),
         status_code=206 if is_partial else 200,
         media_type=media_type,
         headers=headers,
-        background=BackgroundTask(
-            purge_after_stream
-        ),
+        background=BackgroundTask(purge_after_stream),
     )
 
 
-@app.delete(
-    "/api/download/cancel/{job_id}",
-    dependencies=[_auth],
-)
+@app.delete("/api/download/cancel/{job_id}", dependencies=[_auth])
 async def cancel_job(job_id: str):
     async with _job_store_lock:
         job = _job_store.get(job_id)
-
         if not job:
-            raise api_error(
-                404,
-                ErrorCode.JOB_NOT_FOUND,
-                "Job not found",
-            )
+            raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
 
         task = _running_tasks.get(job_id)
-
         if task and not task.done():
             task.cancel()
 
         job.status = JobStatus.CANCELLED
+        job.updated_at = datetime.now(UTC).isoformat()
 
-        job.updated_at = datetime.now(
-            UTC
-        ).isoformat()
-
-    cleanup_path(
-        config.DOWNLOAD_DIR / job_id
-    )
-
-    return {
-        "message": f"Job [{job_id}] cancelled successfully."
-    }
+    cleanup_path(config.DOWNLOAD_DIR / job_id)
+    return {"message": f"Job [{job_id}] cancelled successfully."}
 
 
 if __name__ == "__main__":
@@ -1472,11 +1105,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         reload=config.DEBUG,
-        workers=(
-            config.WORKERS
-            if not config.DEBUG
-            else 1
-        ),
+        workers=config.WORKERS if not config.DEBUG else 1,
         server_header=False,
         date_header=False,
     )
