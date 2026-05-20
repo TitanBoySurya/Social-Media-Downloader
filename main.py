@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 import socket
 import time
 import uuid
@@ -54,7 +55,7 @@ from slowapi.util import get_remote_address
 from starlette.background import BackgroundTask
 
 # ═══════════════════════════════════════════════════════════
-# CONFIG
+# CONFIGURATION MANAGEMENT
 # ═══════════════════════════════════════════════════════════
 
 UTC = timezone.utc
@@ -100,41 +101,23 @@ class Config:
 
     JOB_TTL_SEC: int = int(os.getenv("JOB_TTL_SEC", "600"))
     CLEANUP_INTERVAL: int = int(os.getenv("CLEANUP_INTERVAL", "120"))
-    MAX_CONCURRENT_DOWNLOADS: int = int(
-        os.getenv("MAX_CONCURRENT_DOWNLOADS", "3")
-    )
-    DOWNLOAD_TIMEOUT_SEC: int = int(
-        os.getenv("DOWNLOAD_TIMEOUT_SEC", "900")
-    )
+    MAX_CONCURRENT_DOWNLOADS: int = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+    DOWNLOAD_TIMEOUT_SEC: int = int(os.getenv("DOWNLOAD_TIMEOUT_SEC", "900"))
 
-    # FIX 1: Cookies path with better default search
     COOKIES_FILE: str = os.getenv("COOKIES_FILE", "")
     HTTP_PROXY: str = os.getenv("HTTP_PROXY", "")
 
     WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
-    WEBHOOK_TIMEOUT_SEC: int = int(
-        os.getenv("WEBHOOK_TIMEOUT_SEC", "10")
-    )
+    WEBHOOK_TIMEOUT_SEC: int = int(os.getenv("WEBHOOK_TIMEOUT_SEC", "10"))
 
     ALLOWED_PLATFORMS: set[str] = set(_env_list("ALLOWED_PLATFORMS", ""))
-
     BLOCKED_HOSTS: frozenset[str] = frozenset(
-        {
-            "localhost",
-            "127.0.0.1",
-            "0.0.0.0",
-            "::1",
-            "169.254.169.254",
-            "metadata.google.internal",
-        }
+        {"localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254", "metadata.google.internal"}
     )
 
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", str(64 * 1024)))
-
-    # FIX 2: Stream purge delay — avoid cleanup race condition
     STREAM_PURGE_DELAY_SEC: int = int(os.getenv("STREAM_PURGE_DELAY_SEC", "10"))
 
-    # FIX 3: PO token support (YouTube anti-bot)
     YT_PO_TOKEN: str = os.getenv("YT_PO_TOKEN", "")
     YT_VISITOR_DATA: str = os.getenv("YT_VISITOR_DATA", "")
 
@@ -143,30 +126,7 @@ config = Config()
 config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════
-# FIX 4: Cookies auto-detection — multiple fallback paths
-# ═══════════════════════════════════════════════════════════
-
-_COOKIE_CANDIDATE_PATHS = [
-    config.COOKIES_FILE,
-    "/etc/secrets/cookies.txt",
-    "/etc/secrets/cookies.txt",
-    str(Path(__file__).parent / "cookies.txt"),
-    os.path.expanduser("~/cookies.txt"),
-]
-
-
-def _resolve_cookies_file() -> str:
-    """Return the first existing cookies file path, or empty string."""
-    for path in _COOKIE_CANDIDATE_PATHS:
-        if path and Path(path).is_file():
-            return path
-    return ""
-
-
-RESOLVED_COOKIES_FILE: str = _resolve_cookies_file()
-
-# ═══════════════════════════════════════════════════════════
-# FIX 5: Cleaner production logging
+# UNIFIED PRODUCTION LOGGING ENGINE
 # ═══════════════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -176,12 +136,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger("videosnap")
 
-# Suppress noisy third-party loggers
-logging.getLogger("yt_dlp").setLevel(
-    logging.DEBUG if config.DEBUG else logging.WARNING
-)
+logging.getLogger("yt_dlp").setLevel(logging.DEBUG if config.DEBUG else logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+# ═══════════════════════════════════════════════════════════
+# COOKIES RESOLUTION & SANITIZATION LAYER
+# ═══════════════════════════════════════════════════════════
+
+_COOKIE_CANDIDATE_PATHS = [
+    config.COOKIES_FILE,
+    "/etc/secrets/cookies.txt",
+    str(Path(__file__).parent / "cookies.txt"),
+    os.path.expanduser("~/cookies.txt"),
+]
+
+
+def _resolve_cookies_file() -> str:
+    """Scan and return first valid Netscape-format cookies file."""
+    for path in _COOKIE_CANDIDATE_PATHS:
+        try:
+            if not path:
+                continue
+            p = Path(path)
+            if not p.is_file():
+                continue
+
+            with p.open("r", encoding="utf-8", errors="ignore") as f:
+                first_line = f.readline().strip()
+
+            if "Netscape" not in first_line:
+                logger.warning(f"Skipping invalid cookies file (not Netscape format): {path}")
+                continue
+
+            return str(p)
+        except Exception as exc:
+            logger.warning(f"Failed checking cookies file [{path}]: {exc}")
+    return ""
+
+
+RESOLVED_COOKIES_FILE: str = ""
+_original_cookie_file = _resolve_cookies_file()
+
+if _original_cookie_file:
+    try:
+        writable_cookie_path = Path(tempfile.gettempdir()) / f"videosnap_cookies_{os.getpid()}.txt"
+        shutil.copy2(_original_cookie_file, writable_cookie_path)
+        RESOLVED_COOKIES_FILE = str(writable_cookie_path)
+        logger.info(f"Using sanitized writable cookies path: {RESOLVED_COOKIES_FILE}")
+    except Exception as exc:
+        logger.error(f"Failed to prepare cookies file sandbox path: {exc}")
+else:
+    logger.warning("No valid Netscape-format cookies.txt found. App processing without credentials.")
 
 # ═══════════════════════════════════════════════════════════
 # ERROR TAXONOMY
@@ -209,25 +215,12 @@ class ErrorCode(str, Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
-def api_error(
-    status: int,
-    code: ErrorCode,
-    message: str,
-    *,
-    detail: Any = None,
-) -> HTTPException:
-    return HTTPException(
-        status_code=status,
-        detail={
-            "error": message,
-            "code": code,
-            "detail": detail,
-        },
-    )
+def api_error(status: int, code: ErrorCode, message: str, *, detail: Any = None) -> HTTPException:
+    return HTTPException(status_code=status, detail={"error": message, "code": code, "detail": detail})
 
 
 # ═══════════════════════════════════════════════════════════
-# METRICS
+# METRICS SYSTEM
 # ═══════════════════════════════════════════════════════════
 
 
@@ -238,30 +231,19 @@ def _metric(cls, name, doc, labels=None):
     return cls(name, doc, labels) if labels else cls(name, doc)
 
 
-prom_requests = _metric(
-    Counter, "vs_requests_total", "Total API requests", ["endpoint"]
-)
-prom_downloads = _metric(
-    Counter, "vs_downloads_total", "Completed downloads", ["type"]
-)
+prom_requests = _metric(Counter, "vs_requests_total", "Total API requests", ["endpoint"])
+prom_downloads = _metric(Counter, "vs_downloads_total", "Completed downloads", ["type"])
 prom_errors = _metric(Counter, "vs_errors_total", "Errors", ["code"])
 prom_cache_hits = _metric(Counter, "vs_cache_hits_total", "Info cache hits")
 prom_active_jobs = _metric(Gauge, "vs_active_jobs", "Active download jobs")
-prom_dl_seconds = _metric(
-    Histogram, "vs_download_duration_seconds", "Download wall time"
-)
-prom_dl_bytes = _metric(
-    Counter, "vs_download_bytes_total", "Bytes downloaded"
-)
+prom_dl_seconds = _metric(Histogram, "vs_download_duration_seconds", "Download wall time")
+prom_dl_bytes = _metric(Counter, "vs_download_bytes_total", "Bytes downloaded")
 
 # ═══════════════════════════════════════════════════════════
-# CACHE & STORAGE
+# RUNTIME STORAGE
 # ═══════════════════════════════════════════════════════════
 
-video_info_cache: TTLCache = TTLCache(
-    maxsize=config.CACHE_MAX_SIZE,
-    ttl=config.CACHE_TTL,
-)
+video_info_cache: TTLCache = TTLCache(maxsize=config.CACHE_MAX_SIZE, ttl=config.CACHE_TTL)
 cache_lock = asyncio.Lock()
 
 
@@ -281,24 +263,16 @@ class Job:
     format_id: str
     audio_format: str
     webhook_url: str
-
     status: JobStatus = JobStatus.PENDING
-
     filename: Optional[str] = None
     safe_name: Optional[str] = None
     error: Optional[str] = None
-
     progress: float = 0.0
     speed_bps: Optional[float] = None
     eta_sec: Optional[int] = None
     is_streaming: bool = False
-
-    created_at: str = field(
-        default_factory=lambda: datetime.now(UTC).isoformat()
-    )
-    updated_at: str = field(
-        default_factory=lambda: datetime.now(UTC).isoformat()
-    )
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     expires_at: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -315,41 +289,27 @@ _running_tasks: dict[str, asyncio.Task] = {}
 _shutdown_event = asyncio.Event()
 
 # ═══════════════════════════════════════════════════════════
-# AUTH
+# SECURITY UTILITIES
 # ═══════════════════════════════════════════════════════════
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 limiter = Limiter(key_func=get_remote_address)
 
 
-async def require_api_key(
-    api_key: str = Security(_api_key_header),
-) -> None:
+async def require_api_key(api_key: str = Security(_api_key_header)) -> None:
     if not config.API_KEY:
         return
-
     if not api_key or not secrets.compare_digest(api_key, config.API_KEY):
         prom_errors.labels(code=ErrorCode.UNAUTHORIZED).inc()
         raise HTTPException(
-            status_code=401,
-            detail={
-                "error": "Invalid or missing API key",
-                "code": ErrorCode.UNAUTHORIZED,
-            },
+            status_code=401, detail={"error": "Invalid or missing API key", "code": ErrorCode.UNAUTHORIZED}
         )
 
-
-# FIX 6: hmac.new → hmac.new was WRONG. Must be hmac.new(...) — original
-# code had `hmac.new(...)` which doesn't exist. Correct is `hmac.new`
-# Actually original uses hmac.new which is INVALID — the correct call is
-# `hmac.new(key, msg, digestmod)`. Fixed below.
 
 def _make_token(job_id: str) -> str:
     expires = int(time.time()) + config.TOKEN_TTL_SEC
     payload = f"{job_id}.{expires}"
-    sig = hmac.new(
-        config.TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256
-    ).hexdigest()
+    sig = hmac.new(config.TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}.{sig}"
 
 
@@ -361,14 +321,10 @@ def _verify_token(token: str) -> str:
 
         job_id, expires_str, sig = parts
         payload = f"{job_id}.{expires_str}"
-
-        expected = hmac.new(
-            config.TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256
-        ).hexdigest()
+        expected = hmac.new(config.TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(sig, expected):
             raise api_error(401, ErrorCode.INVALID_TOKEN, "Invalid token")
-
         if int(time.time()) > int(expires_str):
             raise api_error(401, ErrorCode.TOKEN_EXPIRED, "Token expired")
 
@@ -379,13 +335,8 @@ def _verify_token(token: str) -> str:
         raise api_error(401, ErrorCode.INVALID_TOKEN, "Malformed token")
 
 
-# ═══════════════════════════════════════════════════════════
-# SECURITY
-# ═══════════════════════════════════════════════════════════
-
-# FIX 7: DNS lookup with timeout to prevent Render hangs
 def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
-    """Resolve host IPs with a wall-clock timeout."""
+    """Resolve host IPs within an explicit runtime timeout threshold."""
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(socket.getaddrinfo, host, None)
@@ -402,34 +353,27 @@ def validate_url(url: str) -> str:
 
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
-        raise ValueError("Empty host in URL")
-
+        raise ValueError("Empty host in URL target configuration parameters.")
     if host in config.BLOCKED_HOSTS:
-        raise ValueError(f"Blocked host: {host}")
+        raise ValueError(f"Blocked host network route: {host}")
 
     try:
         addr_info = _resolve_host_safe(host)
         for res in addr_info:
             ip_str = res[4][0]
             ip = ipaddress.ip_address(ip_str)
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_reserved
-                or ip.is_link_local
-            ):
-                raise ValueError(f"Private/reserved IP blocked: {ip_str}")
+            if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
+                raise ValueError(f"Private/reserved infrastructure host interface blocked: {ip_str}")
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError(f"Host resolution failed: {exc}") from exc
+        raise ValueError(f"Host execution router compilation routing failed: {exc}") from exc
 
     return url
 
 
 def url_cache_key(url: str) -> str:
     return hashlib.sha256(url.strip().lower().encode()).hexdigest()
-
 
 # ═══════════════════════════════════════════════════════════
 # FILE UTILITIES
@@ -444,18 +388,12 @@ def cleanup_path(path: str | Path) -> None:
         elif p.is_file():
             p.unlink(missing_ok=True)
     except Exception as exc:
-        logger.warning(f"Cleanup failed for {path}: {exc}")
+        logger.warning(f"Cleanup engine drop routine failure context: {path}: {exc}")
 
 
-async def iter_file_range(
-    filepath: Path,
-    start: int,
-    end: int,
-    chunk_size: int = config.CHUNK_SIZE,
-) -> AsyncGenerator[bytes, None]:
+async def iter_file_range(filepath: Path, start: int, end: int, chunk_size: int = config.CHUNK_SIZE) -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_running_loop()
     remaining = end - start + 1
-
     with filepath.open("rb") as fh:
         fh.seek(start)
         while remaining > 0:
@@ -468,7 +406,7 @@ async def iter_file_range(
 
 
 # ═══════════════════════════════════════════════════════════
-# MODELS
+# PYDANTIC SCHEMAS
 # ═══════════════════════════════════════════════════════════
 
 
@@ -564,22 +502,12 @@ class JobStatusResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# FIX 8: YT-DLP CONFIG — Full anti-bot hardening
+# YT-DLP CORE ADVANCED IMPLEMENTATION
 # ═══════════════════════════════════════════════════════════
 
-QUALITY_ORDER = {
-    "8K": 0,
-    "4K": 1,
-    "2K": 2,
-    "1080p": 3,
-    "720p": 4,
-    "480p": 5,
-    "360p": 6,
-}
+QUALITY_ORDER = {"8K": 0, "4K": 1, "2K": 2, "1080p": 3, "720p": 4, "480p": 5, "360p": 6}
 
-# FIX 9: Rotating user-agents — avoid single UA fingerprinting
 _USER_AGENTS = [
-    # Android Chrome (most trusted by YouTube)
     "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 14; Pixel 7a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
@@ -587,57 +515,40 @@ _USER_AGENTS = [
 
 
 def _pick_user_agent() -> str:
-    """Rotate UA per request to reduce fingerprinting."""
     idx = int(time.time() / 60) % len(_USER_AGENTS)
     return _USER_AGENTS[idx]
 
 
 def _build_ydl_common() -> dict[str, Any]:
-    """
-    Build the yt-dlp base options dict at call-time so cookies path is
-    resolved after startup and UA is rotated per invocation.
-    """
-    cookies = RESOLVED_COOKIES_FILE
-
     extractor_args: dict[str, Any] = {
         "youtube": {
-            # FIX 10: tv_embedded is most permissive — bypasses many bot checks
             "player_client": ["tv_embedded", "android", "web"],
             "player_skip": ["configs", "webpage"],
         }
     }
 
-    # FIX 11: PO token support (YouTube's newer bot mitigation)
     if config.YT_PO_TOKEN and config.YT_VISITOR_DATA:
-        extractor_args["youtube"]["po_token"] = [
-            f"web+{config.YT_PO_TOKEN}"
-        ]
+        extractor_args["youtube"]["po_token"] = [f"web+{config.YT_PO_TOKEN}"]
         extractor_args["youtube"]["visitor_data"] = config.YT_VISITOR_DATA
 
     opts: dict[str, Any] = {
         "quiet": not config.DEBUG,
         "no_warnings": not config.DEBUG,
-        "verbose": config.DEBUG,           # FIX 12: verbose in DEBUG mode
+        "verbose": config.DEBUG,
         "noplaylist": True,
         "geo_bypass": True,
         "socket_timeout": config.SOCKET_TIMEOUT,
-
-        # FIX 13: All retry knobs set
         "retries": config.MAX_RETRIES,
         "extractor_retries": config.MAX_RETRIES,
         "file_access_retries": 3,
         "fragment_retries": 5,
-
         "restrictfilenames": True,
         "trim_file_name": 200,
-        "extract_flat": False,             # FIX 14: avoid bot bypass shortcuts
+        "extract_flat": False,
         "extractor_args": extractor_args,
-
-        # FIX 15: Human-like pacing between requests
         "sleep_interval_requests": 1,
         "sleep_interval": 2,
         "max_sleep_interval": 5,
-
         "http_headers": {
             "User-Agent": _pick_user_agent(),
             "Accept-Language": "en-US,en;q=0.9",
@@ -645,25 +556,15 @@ def _build_ydl_common() -> dict[str, Any]:
         },
     }
 
-    if cookies:
-        opts["cookiefile"] = cookies
-        logger.info(f"Using cookies file: {cookies}")
-    else:
-        logger.warning(
-            "No cookies file found — YouTube bot detection may trigger. "
-            "Set COOKIES_FILE env var or place cookies.txt beside main.py"
-        )
-
+    if RESOLVED_COOKIES_FILE:
+        opts["cookiefile"] = RESOLVED_COOKIES_FILE
     if config.HTTP_PROXY:
         opts["proxy"] = config.HTTP_PROXY
 
     return opts
 
 
-def _build_download_opts(
-    job: Job,
-    output_template: str,
-) -> dict[str, Any]:
+def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
     base: dict[str, Any] = {
         **_build_ydl_common(),
         "outtmpl": output_template,
@@ -677,21 +578,13 @@ def _build_download_opts(
             **base,
             "format": "bestaudio/best",
             "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": job.audio_format,
-                    "preferredquality": "0",
-                }
+                {"key": "FFmpegExtractAudio", "preferredcodec": job.audio_format, "preferredquality": "0"}
             ],
         }
 
     return {
         **base,
-        "format": (
-            f"{job.format_id}+bestaudio/best"
-            if job.format_id
-            else "bestvideo+bestaudio/best"
-        ),
+        "format": f"{job.format_id}+bestaudio/best" if job.format_id else "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
     }
 
@@ -723,8 +616,6 @@ def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
     return out
 
 
-# FIX 16: fetch_video_info_sync uses _build_ydl_common() at call time
-# so cookies + UA are always fresh
 def fetch_video_info_sync(url: str) -> VideoInfo:
     opts = {**_build_ydl_common(), "skip_download": True}
     try:
@@ -732,35 +623,27 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         err_str = str(exc)
-        # FIX 17: User-friendly error messages for common YouTube errors
         if "Sign in to confirm" in err_str or "bot" in err_str.lower():
             raise api_error(
                 403,
                 ErrorCode.FETCH_FAILED,
-                "YouTube bot detection triggered. "
-                "Supply a valid cookies.txt via COOKIES_FILE env var. "
-                "See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp",
+                "YouTube bot detection triggered. Valid cookies configuration required.",
                 detail={
-                    "hint": "Export cookies from a logged-in browser session using "
-                            "the yt-dlp cookie exporter extension, then mount as "
-                            "/etc/secrets/cookies.txt on Render.",
+                    "hint": "Export Netscape formatted cookies mapping directly onto Render configuration volumes.",
                     "cookies_loaded": bool(RESOLVED_COOKIES_FILE),
-                    "cookies_path": RESOLVED_COOKIES_FILE or None,
                 },
             )
         if "Private video" in err_str:
-            raise api_error(403, ErrorCode.FETCH_FAILED, "Video is private")
+            raise api_error(403, ErrorCode.FETCH_FAILED, "Requested resource state is private.")
         if "This video is not available" in err_str:
-            raise api_error(404, ErrorCode.FETCH_FAILED, "Video not available in your region")
-        raise api_error(400, ErrorCode.FETCH_FAILED, f"Could not fetch info: {exc}")
+            raise api_error(404, ErrorCode.FETCH_FAILED, "Resource restrictions applied at location region.")
+        raise api_error(400, ErrorCode.FETCH_FAILED, f"Extraction interface parsing exception: {exc}")
     except Exception as exc:
-        raise api_error(
-            400, ErrorCode.FETCH_FAILED, f"Could not fetch info: {exc}"
-        )
+        raise api_error(400, ErrorCode.FETCH_FAILED, f"Extraction framework crash context: {exc}")
 
     duration = info.get("duration") or 0
     if duration > config.MAX_DURATION_SEC:
-        raise api_error(400, ErrorCode.DURATION_EXCEEDED, "Video too long")
+        raise api_error(400, ErrorCode.DURATION_EXCEEDED, "Resource runtime bounds validation exceeded.")
 
     return VideoInfo(
         title=info.get("title", "Unknown"),
@@ -772,9 +655,8 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
         webpage_url=url,
     )
 
-
 # ═══════════════════════════════════════════════════════════
-# DOWNLOAD ENGINE
+# ENGINE PROCESSING DAEMONS
 # ═══════════════════════════════════════════════════════════
 
 
@@ -795,9 +677,7 @@ async def run_download_job(job_id: str) -> None:
         if d.get("status") != "downloading":
             return
 
-        total = (
-            d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        )
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         downloaded = d.get("downloaded_bytes", 0)
         pct = downloaded / total * 100 if total else 0.0
 
@@ -822,7 +702,7 @@ async def run_download_job(job_id: str) -> None:
     try:
         total_b, used_b, free_b = shutil.disk_usage(config.DOWNLOAD_DIR)
         if free_b < (config.MAX_FILESIZE_MB * 1024 * 1024):
-            raise OSError("Insufficient system disk space remaining.")
+            raise OSError("Allocation overflow exception on active storage volume mount.")
 
         opts = _build_download_opts(job, str(out_dir / "%(title)s.%(ext)s"))
         opts["progress_hooks"] = [_progress_hook]
@@ -834,34 +714,16 @@ async def run_download_job(job_id: str) -> None:
         async with _download_semaphore:
             if _shutdown_event.is_set():
                 raise asyncio.CancelledError()
-
-            await asyncio.wait_for(
-                asyncio.to_thread(_blocking_download),
-                timeout=config.DOWNLOAD_TIMEOUT_SEC,
-            )
+            await asyncio.wait_for(asyncio.to_thread(_blocking_download), timeout=config.DOWNLOAD_TIMEOUT_SEC)
 
         files = sorted(
-            [
-                f
-                for f in out_dir.iterdir()
-                if f.suffix
-                in {
-                    ".mp4",
-                    ".mp3",
-                    ".mkv",
-                    ".webm",
-                    ".m4a",
-                    ".opus",
-                    ".flac",
-                    ".wav",
-                }
-            ],
+            [f for f in out_dir.iterdir() if f.suffix in {".mp4", ".mp3", ".mkv", ".webm", ".m4a", ".opus", ".flac", ".wav"}],
             key=lambda f: f.stat().st_mtime,
             reverse=True,
         )
 
         if not files:
-            raise FileNotFoundError("Downloaded file not found")
+            raise FileNotFoundError("Storage allocation target tracking missing from path indices.")
 
         chosen = files[0]
         prom_dl_bytes.inc(chosen.stat().st_size)
@@ -874,50 +736,31 @@ async def run_download_job(job_id: str) -> None:
             job.safe_name = sanitize(chosen.name)
             job.progress = 100.0
             job.updated_at = datetime.now(UTC).isoformat()
-            job.expires_at = (
-                datetime.now(UTC) + timedelta(seconds=config.JOB_TTL_SEC)
-            ).isoformat()
+            job.expires_at = (datetime.now(UTC) + timedelta(seconds=config.JOB_TTL_SEC)).isoformat()
 
         prom_downloads.labels(type="audio" if job.is_audio else "video").inc()
         prom_dl_seconds.observe(time.monotonic() - start_time)
-        logger.info(
-            f"Job {job_id} complete: {chosen.name} "
-            f"({chosen.stat().st_size // 1024} KB, "
-            f"{time.monotonic() - start_time:.1f}s)"
-        )
 
     except asyncio.CancelledError:
         async with _job_store_lock:
             if job_id in _job_store:
                 job.status = JobStatus.CANCELLED
-                job.error = "Job cancelled by request."
+                job.error = "Job compilation terminated via user cancel thread event."
         cleanup_path(out_dir)
-
     except Exception as exc:
         err_msg = str(exc)
-        logger.error(f"Job {job_id} failed: {err_msg}")
         async with _job_store_lock:
             if job_id in _job_store:
                 job.status = JobStatus.FAILED
-                # FIX 18: User-friendly error in job store too
                 if "Sign in to confirm" in err_msg or "bot" in err_msg.lower():
-                    job.error = (
-                        "YouTube bot detection triggered. "
-                        "Provide a valid cookies.txt file."
-                    )
+                    job.error = "YouTube verification requested: anti-bot engine pipeline intercept triggered."
                 else:
                     job.error = err_msg
         cleanup_path(out_dir)
         prom_errors.labels(code=ErrorCode.INTERNAL_ERROR).inc()
-
     finally:
         prom_active_jobs.dec()
         _running_tasks.pop(job_id, None)
-
-
-# ═══════════════════════════════════════════════════════════
-# CLEANUP
-# ═══════════════════════════════════════════════════════════
 
 
 async def _cleanup_scheduler():
@@ -929,8 +772,7 @@ async def _cleanup_scheduler():
             expired = [
                 jid
                 for jid, job in _job_store.items()
-                if job.expires_at
-                and datetime.fromisoformat(job.expires_at) < now
+                if job.expires_at and datetime.fromisoformat(job.expires_at) < now
             ]
 
             for jid in expired:
@@ -946,46 +788,21 @@ async def lifespan(app: FastAPI):
     global _download_semaphore
     _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
 
-    # FIX 19: Startup diagnostics logged properly
-    logger.info(f"Starting {config.APP_NAME} v{config.VERSION}")
-    logger.info(f"Download dir: {config.DOWNLOAD_DIR}")
-    logger.info(
-        f"Cookies file: {RESOLVED_COOKIES_FILE or '(none — bot detection risk!)'}"
-    )
-    logger.info(
-        f"ffmpeg: {'found' if shutil.which('ffmpeg') else 'MISSING — audio extraction will fail'}"
-    )
-    logger.info(
-        f"Max concurrent downloads: {config.MAX_CONCURRENT_DOWNLOADS}"
-    )
-    logger.info(f"Debug mode: {config.DEBUG}")
-
-    if not shutil.which("ffmpeg"):
-        logger.warning(
-            "ffmpeg not found. Audio extraction and video merging will fail. "
-            "Install ffmpeg or add it to PATH."
-        )
-
+    logger.info(f"Starting Engine Interface Router {config.APP_NAME} v{config.VERSION}")
+    logger.info(f"Target tracking partition space allocation mapping initialized path: {RESOLVED_COOKIES_FILE or '(none)'}")
+    
     cleanup_task = asyncio.create_task(_cleanup_scheduler())
     yield
     _shutdown_event.set()
     cleanup_task.cancel()
-
     for task in list(_running_tasks.values()):
         task.cancel()
 
-    logger.info("Shutdown complete.")
-
-
 # ═══════════════════════════════════════════════════════════
-# FASTAPI
+# FASTAPI INSTANTIATION ENGINE
 # ═══════════════════════════════════════════════════════════
 
-app = FastAPI(
-    title=config.APP_NAME,
-    version=config.VERSION,
-    lifespan=lifespan,
-)
+app = FastAPI(title=config.APP_NAME, version=config.VERSION, lifespan=lifespan)
 app.state.limiter = limiter
 
 _has_wildcard = "*" in config.ALLOWED_ORIGINS
@@ -995,12 +812,7 @@ app.add_middleware(
     allow_credentials=not _has_wildcard,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["X-API-Key", "Content-Type", "Range"],
-    expose_headers=[
-        "Content-Disposition",
-        "Content-Range",
-        "Accept-Ranges",
-        "X-Request-ID",
-    ],
+    expose_headers=["Content-Disposition", "Content-Range", "Accept-Ranges", "X-Request-ID"],
 )
 
 
@@ -1015,19 +827,13 @@ async def request_id_middleware(request: Request, call_next):
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error": "Rate limit exceeded",
-            "code": ErrorCode.RATE_LIMITED,
-        },
-    )
+    return JSONResponse(status_code=429, content={"error": "Rate limit exceeded", "code": ErrorCode.RATE_LIMITED})
 
 
 _auth = Depends(require_api_key)
 
 # ═══════════════════════════════════════════════════════════
-# ROUTES
+# ENDPOINT INVOCATION CONTROLLERS
 # ═══════════════════════════════════════════════════════════
 
 
@@ -1037,7 +843,6 @@ async def health():
         "status": "healthy",
         "version": config.VERSION,
         "timestamp": datetime.now(UTC).isoformat(),
-        # FIX 20: Health endpoint exposes cookie status for easy debugging
         "cookies_loaded": bool(RESOLVED_COOKIES_FILE),
         "cookies_path": RESOLVED_COOKIES_FILE or None,
         "ffmpeg_available": bool(shutil.which("ffmpeg")),
@@ -1046,23 +851,12 @@ async def health():
 
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
-    return StreamingResponse(
-        iter([generate_latest()]),
-        media_type=CONTENT_TYPE_LATEST,
-    )
+    return StreamingResponse(iter([generate_latest()]), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post(
-    "/api/info",
-    response_model=VideoInfo,
-    dependencies=[_auth],
-)
+@app.post("/api/info", response_model=VideoInfo, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
-async def get_info(
-    request: Request,
-    req: VideoInfoRequest,
-    response: Response,
-):
+async def get_info(request: Request, req: VideoInfoRequest, response: Response):
     key = url_cache_key(req.url)
     async with cache_lock:
         if key in video_info_cache:
@@ -1071,28 +865,19 @@ async def get_info(
             return video_info_cache[key]
 
     try:
-        info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=30.0
-        )
+        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, req.url), timeout=30.0)
     except asyncio.TimeoutError:
-        raise api_error(
-            408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out."
-        )
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
 
     async with cache_lock:
         video_info_cache[key] = info
-
     response.headers["X-Cache"] = "MISS"
     return info
 
 
 @app.get("/api/info", response_model=VideoInfo, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
-async def get_info_browser(
-    request: Request,
-    url: str = Query(..., min_length=10, max_length=2048),
-    response: Response = None,
-):
+async def get_info_browser(request: Request, url: str = Query(..., min_length=10, max_length=2048), response: Response = None):
     try:
         clean_url = validate_url(url)
     except ValueError as exc:
@@ -1102,57 +887,35 @@ async def get_info_browser(
     async with cache_lock:
         if key in video_info_cache:
             prom_cache_hits.inc()
-            response.headers["X-Cache"] = "HIT"
+            if response:
+                response.headers["X-Cache"] = "HIT"
             return video_info_cache[key]
 
     try:
-        info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0
-        )
+        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0)
     except asyncio.TimeoutError:
-        raise api_error(
-            408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out."
-        )
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
 
     async with cache_lock:
         video_info_cache[key] = info
-
-    response.headers["X-Cache"] = "MISS"
+    if response:
+        response.headers["X-Cache"] = "MISS"
     return info
 
 
-@app.post(
-    "/api/formats",
-    response_model=list[FormatInfo],
-    dependencies=[_auth],
-)
+@app.post("/api/formats", response_model=list[FormatInfo], dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
-async def get_formats(
-    request: Request,
-    req: VideoInfoRequest,
-):
+async def get_formats(request: Request, req: VideoInfoRequest):
     try:
-        info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=30.0
-        )
+        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, req.url), timeout=30.0)
     except asyncio.TimeoutError:
-        raise api_error(
-            408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out."
-        )
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
     return info.formats
 
 
-@app.post(
-    "/api/download/start",
-    response_model=JobResponse,
-    status_code=202,
-    dependencies=[_auth],
-)
+@app.post("/api/download/start", response_model=JobResponse, status_code=202, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_DOWNLOAD)
-async def start_download(
-    request: Request,
-    req: DownloadRequest,
-):
+async def start_download(request: Request, req: DownloadRequest):
     job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
@@ -1169,49 +932,27 @@ async def start_download(
     task = asyncio.create_task(run_download_job(job_id))
     _running_tasks[job_id] = task
 
-    return JobResponse(
-        job_id=job_id,
-        status=JobStatus.PENDING,
-        message="Job enqueued",
-        poll_url=f"/api/download/status/{job_id}",
-    )
+    return JobResponse(job_id=job_id, status=JobStatus.PENDING, message="Job enqueued", poll_url=f"/api/download/status/{job_id}")
 
 
-@app.get(
-    "/api/download/status/{job_id}",
-    response_model=JobStatusResponse,
-    dependencies=[_auth],
-)
+@app.get("/api/download/status/{job_id}", response_model=JobStatusResponse, dependencies=[_auth])
 async def download_status(job_id: str):
     async with _job_store_lock:
         job = _job_store.get(job_id)
 
     if not job:
         raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
-
     token = _make_token(job_id) if job.status == JobStatus.DONE else None
 
     return JobStatusResponse(
-        job_id=job_id,
-        status=job.status,
-        filename=job.safe_name,
-        error=job.error,
-        progress=job.progress,
-        speed_bps=job.speed_bps,
-        eta_sec=job.eta_sec,
-        download_token=token,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-        expires_at=job.expires_at,
+        job_id=job_id, status=job.status, filename=job.safe_name, error=job.error, progress=job.progress,
+        speed_bps=job.speed_bps, eta_sec=job.eta_sec, download_token=token, created_at=job.created_at,
+        updated_at=job.updated_at, expires_at=job.expires_at,
     )
 
 
 @app.get("/api/download/file/{job_id}", dependencies=[_auth])
-async def get_file(
-    job_id: str,
-    token: str,
-    request: Request,
-):
+async def get_file(job_id: str, token: str, request: Request):
     verified_job_id = _verify_token(token)
     if verified_job_id != job_id:
         raise api_error(401, ErrorCode.INVALID_TOKEN, "Invalid token")
@@ -1221,26 +962,18 @@ async def get_file(
 
     if not job_obj:
         raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
-
     if job_obj.status != JobStatus.DONE:
-        raise api_error(
-            400, ErrorCode.JOB_STILL_PROCESSING, "Job still processing"
-        )
+        raise api_error(400, ErrorCode.JOB_STILL_PROCESSING, "Job still processing")
 
     filepath = Path(job_obj.filename) if job_obj.filename else None
     if not filepath or not filepath.is_file():
         raise api_error(404, ErrorCode.FILE_MISSING, "File missing")
 
     file_size = filepath.stat().st_size
-    media_type = (
-        f"audio/{job_obj.audio_format}"
-        if job_obj.is_audio
-        else (mimetypes.guess_type(str(filepath))[0] or "video/mp4")
-    )
+    media_type = f"audio/{job_obj.audio_format}" if job_obj.is_audio else (mimetypes.guess_type(str(filepath))[0] or "video/mp4")
 
     range_header = request.headers.get("Range")
-    start = 0
-    end = file_size - 1
+    start, end = 0, file_size - 1
 
     if range_header:
         match = re.match(r"bytes=(\d+)-(\d*)", range_header)
@@ -1248,7 +981,6 @@ async def get_file(
             start = int(match.group(1))
             end = int(match.group(2)) if match.group(2) else file_size - 1
             end = min(end, file_size - 1)
-
             if start >= file_size or start > end:
                 raise HTTPException(status_code=416, detail="Invalid range")
 
@@ -1260,20 +992,17 @@ async def get_file(
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
     }
-
     if is_partial:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
     async with _job_store_lock:
         job_obj.is_streaming = True
 
-    # FIX 21: Race condition fix — delay before purge so stream finishes
     async def purge_after_stream():
         await asyncio.sleep(config.STREAM_PURGE_DELAY_SEC)
         async with _job_store_lock:
             _job_store.pop(job_id, None)
         cleanup_path(filepath.parent)
-        logger.info(f"Purged job {job_id} after stream.")
 
     return StreamingResponse(
         iter_file_range(filepath, start, end),
@@ -1302,12 +1031,7 @@ async def cancel_job(job_id: str):
     return {"message": f"Job [{job_id}] cancelled successfully."}
 
 
-# ═══════════════════════════════════════════════════════════
-# FIX 22: __main__ block — prints BEFORE uvicorn.run() blocks
-# ═══════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    # Diagnostic prints execute before uvicorn blocks the thread
     print(f"{'='*55}")
     print(f"  {config.APP_NAME} v{config.VERSION}")
     print(f"{'='*55}")
@@ -1315,23 +1039,14 @@ if __name__ == "__main__":
     print(f"  Resolved cookies   : {RESOLVED_COOKIES_FILE or '(none found!)'}")
     print(f"  ffmpeg             : {shutil.which('ffmpeg') or 'NOT FOUND'}")
     print(f"  Download dir       : {config.DOWNLOAD_DIR}")
-    print(f"  Debug              : {config.DEBUG}")
     print(f"  Port               : {config.PORT}")
     print(f"{'='*55}")
-
-    if not RESOLVED_COOKIES_FILE:
-        print(
-            "\n  [WARNING] No cookies.txt found.\n"
-            "  YouTube requests will likely be blocked by bot detection.\n"
-            "  Set COOKIES_FILE=/etc/secrets/cookies.txt on Render.\n"
-        )
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=config.PORT,
         reload=config.DEBUG,
-        # FIX 23: reload=True conflicts with workers > 1; guard this
         workers=config.WORKERS if not config.DEBUG else 1,
         server_header=False,
         date_header=False,
