@@ -477,6 +477,13 @@ class VideoInfo(BaseModel):
     formats: list[FormatInfo]
     webpage_url: str
 
+    @field_validator("duration", mode="before")
+    @classmethod
+    def validate_duration(cls, v):
+        if v is None:
+            return 0
+        return int(float(v))
+
 
 class JobResponse(BaseModel):
     job_id: str
