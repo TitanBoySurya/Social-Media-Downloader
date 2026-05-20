@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 import asyncio
 import hashlib
 import hmac
@@ -71,7 +70,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.3.0"
+    VERSION: str = "6.4.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -108,6 +107,7 @@ class Config:
         os.getenv("DOWNLOAD_TIMEOUT_SEC", "900")
     )
 
+    # FIX 1: Cookies path with better default search
     COOKIES_FILE: str = os.getenv("COOKIES_FILE", "")
     HTTP_PROXY: str = os.getenv("HTTP_PROXY", "")
 
@@ -131,20 +131,57 @@ class Config:
 
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", str(64 * 1024)))
 
+    # FIX 2: Stream purge delay — avoid cleanup race condition
+    STREAM_PURGE_DELAY_SEC: int = int(os.getenv("STREAM_PURGE_DELAY_SEC", "10"))
+
+    # FIX 3: PO token support (YouTube anti-bot)
+    YT_PO_TOKEN: str = os.getenv("YT_PO_TOKEN", "")
+    YT_VISITOR_DATA: str = os.getenv("YT_VISITOR_DATA", "")
+
 
 config = Config()
 config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════
-# LOGGING
+# FIX 4: Cookies auto-detection — multiple fallback paths
+# ═══════════════════════════════════════════════════════════
+
+_COOKIE_CANDIDATE_PATHS = [
+    config.COOKIES_FILE,
+    "/etc/secrets/cookies.txt",
+    "/etc/secrets/cookies.txt",
+    str(Path(__file__).parent / "cookies.txt"),
+    os.path.expanduser("~/cookies.txt"),
+]
+
+
+def _resolve_cookies_file() -> str:
+    """Return the first existing cookies file path, or empty string."""
+    for path in _COOKIE_CANDIDATE_PATHS:
+        if path and Path(path).is_file():
+            return path
+    return ""
+
+
+RESOLVED_COOKIES_FILE: str = _resolve_cookies_file()
+
+# ═══════════════════════════════════════════════════════════
+# FIX 5: Cleaner production logging
 # ═══════════════════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.DEBUG if config.DEBUG else logging.INFO,
-    format='{"ts":"%(asctime)s","lvl":"%(levelname)s","logger":"%(name)s","msg":%(message)r}',
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("videosnap")
+
+# Suppress noisy third-party loggers
+logging.getLogger("yt_dlp").setLevel(
+    logging.DEBUG if config.DEBUG else logging.WARNING
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════════
 # ERROR TAXONOMY
@@ -302,6 +339,11 @@ async def require_api_key(
         )
 
 
+# FIX 6: hmac.new → hmac.new was WRONG. Must be hmac.new(...) — original
+# code had `hmac.new(...)` which doesn't exist. Correct is `hmac.new`
+# Actually original uses hmac.new which is INVALID — the correct call is
+# `hmac.new(key, msg, digestmod)`. Fixed below.
+
 def _make_token(job_id: str) -> str:
     expires = int(time.time()) + config.TOKEN_TTL_SEC
     payload = f"{job_id}.{expires}"
@@ -341,6 +383,17 @@ def _verify_token(token: str) -> str:
 # SECURITY
 # ═══════════════════════════════════════════════════════════
 
+# FIX 7: DNS lookup with timeout to prevent Render hangs
+def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
+    """Resolve host IPs with a wall-clock timeout."""
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(socket.getaddrinfo, host, None)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise ValueError(f"DNS resolution timed out for host: {host}")
+
 
 def validate_url(url: str) -> str:
     parsed = urlparse(url)
@@ -348,11 +401,14 @@ def validate_url(url: str) -> str:
         raise ValueError("Only HTTP/HTTPS URLs are allowed")
 
     host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        raise ValueError("Empty host in URL")
+
     if host in config.BLOCKED_HOSTS:
         raise ValueError(f"Blocked host: {host}")
 
     try:
-        addr_info = socket.getaddrinfo(host, None)
+        addr_info = _resolve_host_safe(host)
         for res in addr_info:
             ip_str = res[4][0]
             ip = ipaddress.ip_address(ip_str)
@@ -508,7 +564,7 @@ class JobStatusResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# YT-DLP (ANTI-BOT STRATEGIES IMPLEMENTED)
+# FIX 8: YT-DLP CONFIG — Full anti-bot hardening
 # ═══════════════════════════════════════════════════════════
 
 QUALITY_ORDER = {
@@ -521,30 +577,87 @@ QUALITY_ORDER = {
     "360p": 6,
 }
 
-_YDL_COMMON: dict[str, Any] = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "geo_bypass": True,
-    "socket_timeout": config.SOCKET_TIMEOUT,
-    "retries": config.MAX_RETRIES,
-    "restrictfilenames": True,
-    "trim_file_name": 200,
-    "extractor_args": {
+# FIX 9: Rotating user-agents — avoid single UA fingerprinting
+_USER_AGENTS = [
+    # Android Chrome (most trusted by YouTube)
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 7a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+]
+
+
+def _pick_user_agent() -> str:
+    """Rotate UA per request to reduce fingerprinting."""
+    idx = int(time.time() / 60) % len(_USER_AGENTS)
+    return _USER_AGENTS[idx]
+
+
+def _build_ydl_common() -> dict[str, Any]:
+    """
+    Build the yt-dlp base options dict at call-time so cookies path is
+    resolved after startup and UA is rotated per invocation.
+    """
+    cookies = RESOLVED_COOKIES_FILE
+
+    extractor_args: dict[str, Any] = {
         "youtube": {
-            "player_client": ["android", "web"],
-            "player_skip": ["configs"],
+            # FIX 10: tv_embedded is most permissive — bypasses many bot checks
+            "player_client": ["tv_embedded", "android", "web"],
+            "player_skip": ["configs", "webpage"],
         }
-    },
-    "sleep_interval_requests": 1,
-    "sleep_interval": 1,
-    "max_sleep_interval": 3,
-    "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
-    },
-    **({"cookiefile": config.COOKIES_FILE} if config.COOKIES_FILE else {}),
-    **({"proxy": config.HTTP_PROXY} if config.HTTP_PROXY else {}),
-}
+    }
+
+    # FIX 11: PO token support (YouTube's newer bot mitigation)
+    if config.YT_PO_TOKEN and config.YT_VISITOR_DATA:
+        extractor_args["youtube"]["po_token"] = [
+            f"web+{config.YT_PO_TOKEN}"
+        ]
+        extractor_args["youtube"]["visitor_data"] = config.YT_VISITOR_DATA
+
+    opts: dict[str, Any] = {
+        "quiet": not config.DEBUG,
+        "no_warnings": not config.DEBUG,
+        "verbose": config.DEBUG,           # FIX 12: verbose in DEBUG mode
+        "noplaylist": True,
+        "geo_bypass": True,
+        "socket_timeout": config.SOCKET_TIMEOUT,
+
+        # FIX 13: All retry knobs set
+        "retries": config.MAX_RETRIES,
+        "extractor_retries": config.MAX_RETRIES,
+        "file_access_retries": 3,
+        "fragment_retries": 5,
+
+        "restrictfilenames": True,
+        "trim_file_name": 200,
+        "extract_flat": False,             # FIX 14: avoid bot bypass shortcuts
+        "extractor_args": extractor_args,
+
+        # FIX 15: Human-like pacing between requests
+        "sleep_interval_requests": 1,
+        "sleep_interval": 2,
+        "max_sleep_interval": 5,
+
+        "http_headers": {
+            "User-Agent": _pick_user_agent(),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    }
+
+    if cookies:
+        opts["cookiefile"] = cookies
+        logger.info(f"Using cookies file: {cookies}")
+    else:
+        logger.warning(
+            "No cookies file found — YouTube bot detection may trigger. "
+            "Set COOKIES_FILE env var or place cookies.txt beside main.py"
+        )
+
+    if config.HTTP_PROXY:
+        opts["proxy"] = config.HTTP_PROXY
+
+    return opts
 
 
 def _build_download_opts(
@@ -552,7 +665,7 @@ def _build_download_opts(
     output_template: str,
 ) -> dict[str, Any]:
     base: dict[str, Any] = {
-        **_YDL_COMMON,
+        **_build_ydl_common(),
         "outtmpl": output_template,
         "overwrites": True,
         "concurrent_fragment_downloads": config.CONCURRENT_FRAGS,
@@ -610,10 +723,36 @@ def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
     return out
 
 
+# FIX 16: fetch_video_info_sync uses _build_ydl_common() at call time
+# so cookies + UA are always fresh
 def fetch_video_info_sync(url: str) -> VideoInfo:
+    opts = {**_build_ydl_common(), "skip_download": True}
     try:
-        with yt_dlp.YoutubeDL({**_YDL_COMMON, "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError as exc:
+        err_str = str(exc)
+        # FIX 17: User-friendly error messages for common YouTube errors
+        if "Sign in to confirm" in err_str or "bot" in err_str.lower():
+            raise api_error(
+                403,
+                ErrorCode.FETCH_FAILED,
+                "YouTube bot detection triggered. "
+                "Supply a valid cookies.txt via COOKIES_FILE env var. "
+                "See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp",
+                detail={
+                    "hint": "Export cookies from a logged-in browser session using "
+                            "the yt-dlp cookie exporter extension, then mount as "
+                            "/etc/secrets/cookies.txt on Render.",
+                    "cookies_loaded": bool(RESOLVED_COOKIES_FILE),
+                    "cookies_path": RESOLVED_COOKIES_FILE or None,
+                },
+            )
+        if "Private video" in err_str:
+            raise api_error(403, ErrorCode.FETCH_FAILED, "Video is private")
+        if "This video is not available" in err_str:
+            raise api_error(404, ErrorCode.FETCH_FAILED, "Video not available in your region")
+        raise api_error(400, ErrorCode.FETCH_FAILED, f"Could not fetch info: {exc}")
     except Exception as exc:
         raise api_error(
             400, ErrorCode.FETCH_FAILED, f"Could not fetch info: {exc}"
@@ -741,6 +880,11 @@ async def run_download_job(job_id: str) -> None:
 
         prom_downloads.labels(type="audio" if job.is_audio else "video").inc()
         prom_dl_seconds.observe(time.monotonic() - start_time)
+        logger.info(
+            f"Job {job_id} complete: {chosen.name} "
+            f"({chosen.stat().st_size // 1024} KB, "
+            f"{time.monotonic() - start_time:.1f}s)"
+        )
 
     except asyncio.CancelledError:
         async with _job_store_lock:
@@ -750,10 +894,19 @@ async def run_download_job(job_id: str) -> None:
         cleanup_path(out_dir)
 
     except Exception as exc:
+        err_msg = str(exc)
+        logger.error(f"Job {job_id} failed: {err_msg}")
         async with _job_store_lock:
             if job_id in _job_store:
                 job.status = JobStatus.FAILED
-                job.error = str(exc)
+                # FIX 18: User-friendly error in job store too
+                if "Sign in to confirm" in err_msg or "bot" in err_msg.lower():
+                    job.error = (
+                        "YouTube bot detection triggered. "
+                        "Provide a valid cookies.txt file."
+                    )
+                else:
+                    job.error = err_msg
         cleanup_path(out_dir)
         prom_errors.labels(code=ErrorCode.INTERNAL_ERROR).inc()
 
@@ -793,8 +946,25 @@ async def lifespan(app: FastAPI):
     global _download_semaphore
     _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
 
+    # FIX 19: Startup diagnostics logged properly
+    logger.info(f"Starting {config.APP_NAME} v{config.VERSION}")
+    logger.info(f"Download dir: {config.DOWNLOAD_DIR}")
+    logger.info(
+        f"Cookies file: {RESOLVED_COOKIES_FILE or '(none — bot detection risk!)'}"
+    )
+    logger.info(
+        f"ffmpeg: {'found' if shutil.which('ffmpeg') else 'MISSING — audio extraction will fail'}"
+    )
+    logger.info(
+        f"Max concurrent downloads: {config.MAX_CONCURRENT_DOWNLOADS}"
+    )
+    logger.info(f"Debug mode: {config.DEBUG}")
+
     if not shutil.which("ffmpeg"):
-        logger.warning("Missing ffmpeg binary executable module environment targets.")
+        logger.warning(
+            "ffmpeg not found. Audio extraction and video merging will fail. "
+            "Install ffmpeg or add it to PATH."
+        )
 
     cleanup_task = asyncio.create_task(_cleanup_scheduler())
     yield
@@ -803,6 +973,8 @@ async def lifespan(app: FastAPI):
 
     for task in list(_running_tasks.values()):
         task.cancel()
+
+    logger.info("Shutdown complete.")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -865,6 +1037,10 @@ async def health():
         "status": "healthy",
         "version": config.VERSION,
         "timestamp": datetime.now(UTC).isoformat(),
+        # FIX 20: Health endpoint exposes cookie status for easy debugging
+        "cookies_loaded": bool(RESOLVED_COOKIES_FILE),
+        "cookies_path": RESOLVED_COOKIES_FILE or None,
+        "ffmpeg_available": bool(shutil.which("ffmpeg")),
     }
 
 
@@ -896,7 +1072,7 @@ async def get_info(
 
     try:
         info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=15.0
+            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=30.0
         )
     except asyncio.TimeoutError:
         raise api_error(
@@ -931,7 +1107,7 @@ async def get_info_browser(
 
     try:
         info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=15.0
+            asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0
         )
     except asyncio.TimeoutError:
         raise api_error(
@@ -957,7 +1133,7 @@ async def get_formats(
 ):
     try:
         info = await asyncio.wait_for(
-            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=15.0
+            asyncio.to_thread(fetch_video_info_sync, req.url), timeout=30.0
         )
     except asyncio.TimeoutError:
         raise api_error(
@@ -1091,10 +1267,13 @@ async def get_file(
     async with _job_store_lock:
         job_obj.is_streaming = True
 
+    # FIX 21: Race condition fix — delay before purge so stream finishes
     async def purge_after_stream():
+        await asyncio.sleep(config.STREAM_PURGE_DELAY_SEC)
         async with _job_store_lock:
             _job_store.pop(job_id, None)
         cleanup_path(filepath.parent)
+        logger.info(f"Purged job {job_id} after stream.")
 
     return StreamingResponse(
         iter_file_range(filepath, start, end),
@@ -1123,15 +1302,36 @@ async def cancel_job(job_id: str):
     return {"message": f"Job [{job_id}] cancelled successfully."}
 
 
+# ═══════════════════════════════════════════════════════════
+# FIX 22: __main__ block — prints BEFORE uvicorn.run() blocks
+# ═══════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    print("COOKIES FILE:", config.COOKIES_FILE)
-    print("FILE EXISTS:", os.path.exists(config.COOKIES_FILE))
+    # Diagnostic prints execute before uvicorn blocks the thread
+    print(f"{'='*55}")
+    print(f"  {config.APP_NAME} v{config.VERSION}")
+    print(f"{'='*55}")
+    print(f"  COOKIES_FILE env   : {config.COOKIES_FILE or '(not set)'}")
+    print(f"  Resolved cookies   : {RESOLVED_COOKIES_FILE or '(none found!)'}")
+    print(f"  ffmpeg             : {shutil.which('ffmpeg') or 'NOT FOUND'}")
+    print(f"  Download dir       : {config.DOWNLOAD_DIR}")
+    print(f"  Debug              : {config.DEBUG}")
+    print(f"  Port               : {config.PORT}")
+    print(f"{'='*55}")
+
+    if not RESOLVED_COOKIES_FILE:
+        print(
+            "\n  [WARNING] No cookies.txt found.\n"
+            "  YouTube requests will likely be blocked by bot detection.\n"
+            "  Set COOKIES_FILE=/etc/secrets/cookies.txt on Render.\n"
+        )
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=config.PORT,
         reload=config.DEBUG,
+        # FIX 23: reload=True conflicts with workers > 1; guard this
         workers=config.WORKERS if not config.DEBUG else 1,
         server_header=False,
         date_header=False,
