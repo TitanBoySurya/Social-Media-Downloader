@@ -1124,6 +1124,9 @@ async def cancel_job(job_id: str):
 
 
 if __name__ == "__main__":
+    print("COOKIES FILE:", config.COOKIES_FILE)
+    print("FILE EXISTS:", os.path.exists(config.COOKIES_FILE))
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
