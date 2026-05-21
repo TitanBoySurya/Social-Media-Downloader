@@ -71,7 +71,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.6.0"
+    VERSION: str = "6.7.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -95,7 +95,7 @@ class Config:
 
     MAX_FILESIZE_MB: int = int(os.getenv("MAX_FILESIZE_MB", "500"))
     MAX_DURATION_SEC: int = int(os.getenv("MAX_DURATION_SEC", "3600"))
-    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "10"))  # Upgraded to 10 for server stability
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "10"))
     SOCKET_TIMEOUT: int = int(os.getenv("SOCKET_TIMEOUT", "30"))
     CONCURRENT_FRAGS: int = int(os.getenv("CONCURRENT_FRAGS", "4"))
 
@@ -347,14 +347,21 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
 
 
 async def resolve_redirect_url(url: str) -> str:
-    """FIX 3: Unrolls shared short links (e.g. Facebook share/v/) to avoid extraction exceptions."""
+    """FIX 3: Unrolls shared short links (e.g. Facebook share/v/) via spoofed browser headers."""
     try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Referer": "https://www.facebook.com/"
+        }
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
-            r = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "*/*",
-                "Referer": "https://www.facebook.com/"
-            })
+            r = await client.get(url, headers=headers)
+            logger.info(f"URL Resolved from link extraction sequence: {r.url}")
             return str(r.url)
     except Exception as e:
         logger.warning(f"Redirect resolver extraction failed for {url}: {e}")
@@ -511,7 +518,6 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 14; Pixel 7a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
 
-# FIX 7: Advanced Anti-Bot Recognition Checkpoints (Upgraded)
 ANTI_BOT_PATTERNS = [
     "Sign in to confirm",
     "This helps protect our community",
@@ -529,13 +535,12 @@ def _pick_user_agent() -> str:
 def _build_ydl_common() -> dict[str, Any]:
     extractor_args: dict[str, Any] = {
         "youtube": {
-            # FIX 4: Extended client pool to maximize extraction surface
             "player_client": ["android", "web", "tv_embedded", "ios"],
             "player_skip": ["configs"],
             "skip": ["hls", "dash"]
         },
         "facebook": {
-            "api": "graphql",  # FIX: Forced GraphQL core processing
+            "api": "graphql",
             "format": "hd"
         }
     }
@@ -551,7 +556,7 @@ def _build_ydl_common() -> dict[str, Any]:
         "noplaylist": True,
         "geo_bypass": True,
         "socket_timeout": config.SOCKET_TIMEOUT,
-        "retries": 10,              # Increased parameters for Render architecture stability
+        "retries": 10,
         "extractor_retries": 10,
         "fragment_retries": 10,
         "file_access_retries": 3,
@@ -562,20 +567,14 @@ def _build_ydl_common() -> dict[str, Any]:
         "sleep_interval_requests": 1,
         "sleep_interval": 2,
         "max_sleep_interval": 5,
-        
-        # FIX 5 & 6: Production manifest configurations
         "youtube_include_dash_manifest": True,
         "youtube_include_hls_manifest": True,
         "clean_infojson": True,
         "prefer_insecure": False,
         "default_search": "auto",
-        
-        # FIX 13: Added standard compatibility checkpoint options
         "compat_opts": {
             "manifest-filesize-approx",
         },
-        
-        # Improved Facebook spoofing network layout headers
         "http_headers": {
             "User-Agent": _pick_user_agent(),
             "Accept": "*/*",
@@ -613,7 +612,7 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
 
     return {
         **base,
-        # FIX 1: Upgraded robust fallback pairing chain definitions (bv*+ba/b framework)
+        # FIX 1: Robust fallback adaptive pipeline (bv*+ba/b structural fallback)
         "format": f"{job.format_id}+bestaudio/{job.format_id}/bv*+ba/b" if job.format_id else "bv*+ba/b",
         "merge_output_format": "mp4",
     }
@@ -624,8 +623,6 @@ def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
     for fmt in raw_formats:
         if not fmt.get("format_id"):
             continue
-            
-        # FIX: Drop m3u8_native directly to clear out unstable HLS Facebook chunks
         if fmt.get("protocol") == "m3u8_native":
             continue
 
@@ -678,7 +675,6 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
     except Exception as exc:
         raise api_error(400, ErrorCode.FETCH_FAILED, f"Extraction framework crash context: {exc}")
 
-    # FIX 8: Validate that format arrays are not completely stripped out
     if not info or not info.get("formats"):
         raise api_error(400, ErrorCode.FETCH_FAILED, "No downloadable formats available on destination stream.")
 
@@ -829,12 +825,10 @@ async def lifespan(app: FastAPI):
     global _download_semaphore
     _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
 
-    # FIX 9: Enforce mandatory binary validation check for tracking system packages at launch
     if not shutil.which("ffmpeg"):
         logger.error("FATAL INSTANTIATION ERROR: ffmpeg binary engine unallocated inside server context.")
         raise RuntimeError("ffmpeg execution context missing. Add binaries to continuous path environments.")
 
-    # FIX 10: Dynamic version logging footprint parameters
     logger.info(f"Starting Engine Interface Router {config.APP_NAME} v{config.VERSION}")
     logger.info(f"Core engine library version fingerprint -> yt-dlp: {yt_dlp.version.__version__}")
     logger.info(f"Target tracking partition space allocation mapping initialized path: {RESOLVED_COOKIES_FILE or '(none)'}")
@@ -905,7 +899,6 @@ async def metrics():
 @app.post("/api/info", response_model=VideoInfo, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
 async def get_info(request: Request, req: VideoInfoRequest, response: Response):
-    # FIX 3: Redirect link resolving optimization filter
     resolved_url = await resolve_redirect_url(req.url)
     key = url_cache_key(resolved_url)
     
@@ -929,7 +922,6 @@ async def get_info(request: Request, req: VideoInfoRequest, response: Response):
 @app.get("/api/info", response_model=VideoInfo, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
 async def get_info_browser(request: Request, url: str = Query(..., min_length=10, max_length=2048), response: Response = None):
-    # FIX 3: Redirect link resolving optimization filter
     resolved_url = await resolve_redirect_url(url)
     try:
         clean_url = validate_url(resolved_url)
@@ -972,7 +964,6 @@ async def get_formats(request: Request, req: VideoInfoRequest):
 async def start_download(request: Request, req: DownloadRequest):
     resolved_url = await resolve_redirect_url(req.url)
     
-    # FIX 1: Run sync inline format safety pre-validation check before queue extraction
     opts = _build_ydl_common()
     if req.format_id:
         try:
