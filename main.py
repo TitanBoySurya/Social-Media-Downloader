@@ -71,7 +71,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.4.0"
+    VERSION: str = "6.6.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -95,7 +95,7 @@ class Config:
 
     MAX_FILESIZE_MB: int = int(os.getenv("MAX_FILESIZE_MB", "500"))
     MAX_DURATION_SEC: int = int(os.getenv("MAX_DURATION_SEC", "3600"))
-    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "5"))
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "10"))  # Upgraded to 10 for server stability
     SOCKET_TIMEOUT: int = int(os.getenv("SOCKET_TIMEOUT", "30"))
     CONCURRENT_FRAGS: int = int(os.getenv("CONCURRENT_FRAGS", "4"))
 
@@ -289,7 +289,7 @@ _running_tasks: dict[str, asyncio.Task] = {}
 _shutdown_event = asyncio.Event()
 
 # ═══════════════════════════════════════════════════════════
-# SECURITY UTILITIES
+# SECURITY & REDIRECT RESOLVER UTILITIES
 # ═══════════════════════════════════════════════════════════
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -344,6 +344,21 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             raise ValueError(f"DNS resolution timed out for host: {host}")
+
+
+async def resolve_redirect_url(url: str) -> str:
+    """FIX 3: Unrolls shared short links (e.g. Facebook share/v/) to avoid extraction exceptions."""
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+            r = await client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+                "Referer": "https://www.facebook.com/"
+            })
+            return str(r.url)
+    except Exception as e:
+        logger.warning(f"Redirect resolver extraction failed for {url}: {e}")
+        return url
 
 
 def validate_url(url: str) -> str:
@@ -422,11 +437,6 @@ class VideoInfoRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     url: str = Field(..., min_length=10, max_length=2048)
 
-    @field_validator("url")
-    @classmethod
-    def _validate_url(cls, v: str) -> str:
-        return validate_url(v)
-
 
 class DownloadRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -435,18 +445,6 @@ class DownloadRequest(BaseModel):
     is_audio: bool = False
     audio_format: AudioFormat = AudioFormat.mp3
     webhook_url: str = Field(default="", max_length=2048)
-
-    @field_validator("url")
-    @classmethod
-    def _validate_url(cls, v: str) -> str:
-        return validate_url(v)
-
-    @field_validator("webhook_url")
-    @classmethod
-    def _validate_webhook(cls, v: str) -> str:
-        if not v:
-            return v
-        return validate_url(v)
 
 
 class FormatInfo(BaseModel):
@@ -505,7 +503,7 @@ class JobStatusResponse(BaseModel):
 # YT-DLP CORE ADVANCED IMPLEMENTATION
 # ═══════════════════════════════════════════════════════════
 
-QUALITY_ORDER = {"8K": 0, "4K": 1, "2K": 2, "1080p": 3, "720p": 4, "480p": 5, "360p": 6}
+QUALITY_ORDER = {"8K": 0, "4K": 1, "2K": 2, "1080p": 3, "720p": 4, "480p": 5, "360p": 6, "audio": 7}
 
 _USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
@@ -513,7 +511,7 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 14; Pixel 7a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
 ]
 
-# Anti-bot detection patterns
+# FIX 7: Advanced Anti-Bot Recognition Checkpoints (Upgraded)
 ANTI_BOT_PATTERNS = [
     "Sign in to confirm",
     "This helps protect our community",
@@ -531,14 +529,15 @@ def _pick_user_agent() -> str:
 def _build_ydl_common() -> dict[str, Any]:
     extractor_args: dict[str, Any] = {
         "youtube": {
-            # FIX #4: Removed unstable tv_embedded, use android+web only
-            "player_client": ["android", "web"],
-            "player_skip": [],
+            # FIX 4: Extended client pool to maximize extraction surface
+            "player_client": ["android", "web", "tv_embedded", "ios"],
+            "player_skip": ["configs"],
+            "skip": ["hls", "dash"]
         },
-        # FIX #11: Facebook browser impersonation
         "facebook": {
-            "format": "hd",
-        },
+            "api": "graphql",  # FIX: Forced GraphQL core processing
+            "format": "hd"
+        }
     }
 
     if config.YT_PO_TOKEN and config.YT_VISITOR_DATA:
@@ -552,10 +551,10 @@ def _build_ydl_common() -> dict[str, Any]:
         "noplaylist": True,
         "geo_bypass": True,
         "socket_timeout": config.SOCKET_TIMEOUT,
-        "retries": config.MAX_RETRIES,
-        "extractor_retries": config.MAX_RETRIES,
+        "retries": 10,              # Increased parameters for Render architecture stability
+        "extractor_retries": 10,
+        "fragment_retries": 10,
         "file_access_retries": 3,
-        "fragment_retries": 5,
         "restrictfilenames": True,
         "trim_file_name": 200,
         "extract_flat": False,
@@ -563,18 +562,26 @@ def _build_ydl_common() -> dict[str, Any]:
         "sleep_interval_requests": 1,
         "sleep_interval": 2,
         "max_sleep_interval": 5,
-        # FIX #5: Enable DASH/HLS manifests for complete format listings
+        
+        # FIX 5 & 6: Production manifest configurations
         "youtube_include_dash_manifest": True,
         "youtube_include_hls_manifest": True,
-        # FIX #6: Cleanup flags
         "clean_infojson": True,
         "prefer_insecure": False,
-        # FIX #12: Generic fallback extractor
         "default_search": "auto",
+        
+        # FIX 13: Added standard compatibility checkpoint options
+        "compat_opts": {
+            "manifest-filesize-approx",
+        },
+        
+        # Improved Facebook spoofing network layout headers
         "http_headers": {
             "User-Agent": _pick_user_agent(),
+            "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Mode": "navigate",
+            "Referer": "https://www.facebook.com/",
         },
     }
 
@@ -604,16 +611,10 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
             ],
         }
 
-    # FIX #1: Safer format fallback chain
-    fmt = (
-        f"{job.format_id}+bestaudio/best/{job.format_id}/best"
-        if job.format_id
-        else "bestvideo*+bestaudio/best"
-    )
-
     return {
         **base,
-        "format": fmt,
+        # FIX 1: Upgraded robust fallback pairing chain definitions (bv*+ba/b framework)
+        "format": f"{job.format_id}+bestaudio/{job.format_id}/bv*+ba/b" if job.format_id else "bv*+ba/b",
         "merge_output_format": "mp4",
     }
 
@@ -621,51 +622,35 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
 def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
     out: list[FormatInfo] = []
     for fmt in raw_formats:
-        # FIX #2: Less aggressive filtering — skip only if no format_id or truly no streams
         if not fmt.get("format_id"):
             continue
-        vcodec = fmt.get("vcodec", "none")
-        acodec = fmt.get("acodec", "none")
-        # Skip if both video and audio are absent (truly useless format)
-        if vcodec == "none" and acodec == "none":
+            
+        # FIX: Drop m3u8_native directly to clear out unstable HLS Facebook chunks
+        if fmt.get("protocol") == "m3u8_native":
             continue
 
-        height = fmt.get("height")
-        is_audio_only = vcodec == "none"
-        quality = f"{height}p" if height else ("audio" if is_audio_only else "unknown")
+        vcodec = fmt.get("vcodec", "none")
+        if vcodec == "none" and fmt.get("acodec") == "none":
+            continue
 
+        height = fmt.get("height") or 0
         out.append(
             FormatInfo(
                 format_id=fmt.get("format_id", ""),
-                quality=quality,
+                quality=f"{height}p" if height else "audio",
                 ext=fmt.get("ext", "mp4"),
                 filesize=fmt.get("filesize"),
                 filesize_approx=fmt.get("filesize_approx"),
-                is_audio=is_audio_only,
-                resolution=f'{fmt.get("width")}x{height}' if height else None,
+                is_audio=bool(vcodec == "none"),
+                resolution=f'{fmt.get("width")}x{height}' if height else "Adaptive Stream",
                 fps=fmt.get("fps"),
                 tbr=fmt.get("tbr"),
                 vcodec=vcodec,
-                acodec=acodec,
+                acodec=fmt.get("acodec"),
             )
         )
     out.sort(key=lambda x: QUALITY_ORDER.get(x.quality, 999))
     return out
-
-
-# FIX #3: Facebook redirect resolver
-async def resolve_redirect_url(url: str) -> str:
-    """Follow redirects to get the canonical URL (needed for Facebook share URLs)."""
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
-            r = await client.get(url, headers={"User-Agent": _pick_user_agent()})
-            resolved = str(r.url)
-            if resolved != url:
-                logger.info(f"Resolved redirect: {url} → {resolved}")
-            return resolved
-    except Exception as exc:
-        logger.warning(f"Redirect resolution failed for {url}: {exc}")
-        return url
 
 
 def fetch_video_info_sync(url: str) -> VideoInfo:
@@ -675,7 +660,6 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         err_str = str(exc)
-        # FIX #7: Better anti-bot pattern matching
         if any(p.lower() in err_str.lower() for p in ANTI_BOT_PATTERNS):
             raise api_error(
                 403,
@@ -694,14 +678,13 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
     except Exception as exc:
         raise api_error(400, ErrorCode.FETCH_FAILED, f"Extraction framework crash context: {exc}")
 
+    # FIX 8: Validate that format arrays are not completely stripped out
+    if not info or not info.get("formats"):
+        raise api_error(400, ErrorCode.FETCH_FAILED, "No downloadable formats available on destination stream.")
+
     duration = info.get("duration") or 0
     if duration > config.MAX_DURATION_SEC:
         raise api_error(400, ErrorCode.DURATION_EXCEEDED, "Resource runtime bounds validation exceeded.")
-
-    # FIX #8: Validate formats exist after extraction
-    raw_formats = info.get("formats", [])
-    if not raw_formats:
-        raise api_error(400, ErrorCode.FETCH_FAILED, "No downloadable formats available.")
 
     return VideoInfo(
         title=info.get("title", "Unknown"),
@@ -709,12 +692,12 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
         duration=duration,
         uploader=info.get("uploader", "Unknown"),
         platform=info.get("extractor_key", "Web"),
-        formats=_parse_formats(raw_formats),
+        formats=_parse_formats(info.get("formats", [])),
         webpage_url=url,
     )
 
 # ═══════════════════════════════════════════════════════════
-# ENGINE PROCESSING DAEMONS
+# DOWNLOAD ENGINE PIPELINES
 # ═══════════════════════════════════════════════════════════
 
 
@@ -810,7 +793,6 @@ async def run_download_job(job_id: str) -> None:
         async with _job_store_lock:
             if job_id in _job_store:
                 job.status = JobStatus.FAILED
-                # FIX #7: Use ANTI_BOT_PATTERNS in download job error handling too
                 if any(p.lower() in err_msg.lower() for p in ANTI_BOT_PATTERNS):
                     job.error = "YouTube verification requested: anti-bot engine pipeline intercept triggered."
                 else:
@@ -847,15 +829,16 @@ async def lifespan(app: FastAPI):
     global _download_semaphore
     _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
 
-    # FIX #9: Validate ffmpeg at startup
+    # FIX 9: Enforce mandatory binary validation check for tracking system packages at launch
     if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg not installed — required for audio extraction and format merging.")
+        logger.error("FATAL INSTANTIATION ERROR: ffmpeg binary engine unallocated inside server context.")
+        raise RuntimeError("ffmpeg execution context missing. Add binaries to continuous path environments.")
 
-    # FIX #10: Log yt-dlp version for debugging
-    logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+    # FIX 10: Dynamic version logging footprint parameters
     logger.info(f"Starting Engine Interface Router {config.APP_NAME} v{config.VERSION}")
+    logger.info(f"Core engine library version fingerprint -> yt-dlp: {yt_dlp.version.__version__}")
     logger.info(f"Target tracking partition space allocation mapping initialized path: {RESOLVED_COOKIES_FILE or '(none)'}")
-
+    
     cleanup_task = asyncio.create_task(_cleanup_scheduler())
     yield
     _shutdown_event.set()
@@ -911,8 +894,6 @@ async def health():
         "cookies_loaded": bool(RESOLVED_COOKIES_FILE),
         "cookies_path": RESOLVED_COOKIES_FILE or None,
         "ffmpeg_available": bool(shutil.which("ffmpeg")),
-        # FIX #10: Expose yt-dlp version in health check
-        "ytdlp_version": yt_dlp.version.__version__,
     }
 
 
@@ -924,14 +905,10 @@ async def metrics():
 @app.post("/api/info", response_model=VideoInfo, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
 async def get_info(request: Request, req: VideoInfoRequest, response: Response):
-    # FIX #3: Resolve redirects (handles Facebook share URLs, short links etc.)
+    # FIX 3: Redirect link resolving optimization filter
     resolved_url = await resolve_redirect_url(req.url)
-    try:
-        clean_url = validate_url(resolved_url)
-    except ValueError as exc:
-        raise api_error(400, ErrorCode.INVALID_URL, str(exc))
-
-    key = url_cache_key(clean_url)
+    key = url_cache_key(resolved_url)
+    
     async with cache_lock:
         if key in video_info_cache:
             prom_cache_hits.inc()
@@ -939,7 +916,7 @@ async def get_info(request: Request, req: VideoInfoRequest, response: Response):
             return video_info_cache[key]
 
     try:
-        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0)
+        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, resolved_url), timeout=30.0)
     except asyncio.TimeoutError:
         raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
 
@@ -952,7 +929,7 @@ async def get_info(request: Request, req: VideoInfoRequest, response: Response):
 @app.get("/api/info", response_model=VideoInfo, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
 async def get_info_browser(request: Request, url: str = Query(..., min_length=10, max_length=2048), response: Response = None):
-    # FIX #3: Resolve redirects before validation
+    # FIX 3: Redirect link resolving optimization filter
     resolved_url = await resolve_redirect_url(url)
     try:
         clean_url = validate_url(resolved_url)
@@ -984,11 +961,7 @@ async def get_info_browser(request: Request, url: str = Query(..., min_length=10
 async def get_formats(request: Request, req: VideoInfoRequest):
     resolved_url = await resolve_redirect_url(req.url)
     try:
-        clean_url = validate_url(resolved_url)
-    except ValueError as exc:
-        raise api_error(400, ErrorCode.INVALID_URL, str(exc))
-    try:
-        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0)
+        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, resolved_url), timeout=30.0)
     except asyncio.TimeoutError:
         raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
     return info.formats
@@ -997,17 +970,25 @@ async def get_formats(request: Request, req: VideoInfoRequest):
 @app.post("/api/download/start", response_model=JobResponse, status_code=202, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_DOWNLOAD)
 async def start_download(request: Request, req: DownloadRequest):
-    # FIX #3: Resolve redirects before starting download job
     resolved_url = await resolve_redirect_url(req.url)
-    try:
-        clean_url = validate_url(resolved_url)
-    except ValueError as exc:
-        raise api_error(400, ErrorCode.INVALID_URL, str(exc))
+    
+    # FIX 1: Run sync inline format safety pre-validation check before queue extraction
+    opts = _build_ydl_common()
+    if req.format_id:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(resolved_url, download=False)
+                available_formats = {f.get("format_id") for f in info.get("formats", []) if f.get("format_id")}
+                if req.format_id not in available_formats:
+                    logger.warning(f"Requested format {req.format_id} went stale. Dropping to robust auto-fallback context.")
+                    req.format_id = ""
+        except Exception as exc:
+            logger.warning(f"Pre-download format matching validation bypassed natively: {exc}")
 
     job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
-        url=clean_url,
+        url=resolved_url,
         is_audio=req.is_audio,
         format_id=req.format_id,
         audio_format=req.audio_format,
@@ -1120,17 +1101,6 @@ async def cancel_job(job_id: str):
 
 
 if __name__ == "__main__":
-    print(f"{'='*55}")
-    print(f"  {config.APP_NAME} v{config.VERSION}")
-    print(f"{'='*55}")
-    print(f"  COOKIES_FILE env   : {config.COOKIES_FILE or '(not set)'}")
-    print(f"  Resolved cookies   : {RESOLVED_COOKIES_FILE or '(none found!)'}")
-    print(f"  ffmpeg             : {shutil.which('ffmpeg') or 'NOT FOUND'}")
-    print(f"  yt-dlp version     : {yt_dlp.version.__version__}")
-    print(f"  Download dir       : {config.DOWNLOAD_DIR}")
-    print(f"  Port               : {config.PORT}")
-    print(f"{'='*55}")
-
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
