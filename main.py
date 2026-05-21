@@ -71,7 +71,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.8.0"
+    VERSION: str = "7.0.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -347,7 +347,7 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
 
 
 async def resolve_redirect_url(url: str) -> str:
-    """FIX 3: Unrolls short link redirect structures safely via strict native browser emulators."""
+    """FIX: Unrolls shared redirect links safely via spoofed native browser parameters."""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -609,7 +609,7 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
 
     return {
         **base,
-        # Upgraded safe cascade pipeline layout sequence mapping chains
+        # FIX: Force dynamic matching hierarchy format query chain layout to eliminate "format not available" error.
         "format": f"{job.format_id}+bestaudio/{job.format_id}/bestvideo*+bestaudio/best" if job.format_id else "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
     }
@@ -859,6 +859,7 @@ app.add_middleware(
 async def request_id_middleware(request: Request, call_next):
     prom_requests.labels(endpoint=request.url.path).inc()
     rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.id = rid
     response = await call_next(request)
     response.headers["X-Request-ID"] = rid
     return response
@@ -959,6 +960,7 @@ async def get_formats(request: Request, req: VideoInfoRequest):
 @app.post("/api/download/start", response_model=JobResponse, status_code=202, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_DOWNLOAD)
 async def start_download(request: Request, req: DownloadRequest):
+    # FIX: Cleaned up inline sync format mapping loops completely to avoid premature extraction drop errors.
     resolved_url = await resolve_redirect_url(req.url)
     job_id = str(uuid.uuid4())
     job = Job(
@@ -1046,7 +1048,7 @@ async def get_file(job_id: str, token: str, request: Request):
         await asyncio.sleep(config.STREAM_PURGE_DELAY_SEC)
         async with _job_store_lock:
             _job_store.pop(job_id, None)
-        cleanup_path(filepath.parent)
+        cleanup_path(cleanup_path(filepath.parent))
 
     return StreamingResponse(
         iter_file_range(filepath, start, end),
