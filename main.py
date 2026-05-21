@@ -165,7 +165,7 @@ def _resolve_cookies_file() -> str:
             with p.open("r", encoding="utf-8", errors="ignore") as f:
                 first_line = f.readline().strip()
 
-            if "Netscape" not in first_line:
+            if "Netscape" not in first_line and "# Netscape" not in first_line:
                 logger.warning(f"Skipping invalid cookies file (not Netscape format): {path}")
                 continue
 
@@ -347,7 +347,7 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
 
 
 async def resolve_redirect_url(url: str) -> str:
-    """FIX 3: Unrolls Facebook and YouTube short redirect sequences smoothly with strict browser emulation."""
+    """FIX 3: Unrolls short link redirect structures safely via strict native browser emulators."""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -609,7 +609,7 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
 
     return {
         **base,
-        # FIX 1: Robust Adaptive Multi-Fallback Matching Chains (Bypasses Requested Format Error)
+        # Upgraded safe cascade pipeline layout sequence mapping chains
         "format": f"{job.format_id}+bestaudio/{job.format_id}/bestvideo*+bestaudio/best" if job.format_id else "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
     }
@@ -959,7 +959,6 @@ async def get_formats(request: Request, req: VideoInfoRequest):
 @app.post("/api/download/start", response_model=JobResponse, status_code=202, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_DOWNLOAD)
 async def start_download(request: Request, req: DownloadRequest):
-    # FIX 1: Cleaned up inline sync format mapping filters to avoid premature parsing drops
     resolved_url = await resolve_redirect_url(req.url)
     job_id = str(uuid.uuid4())
     job = Job(
