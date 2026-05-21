@@ -7,8 +7,8 @@ RUN apt-get update && apt-get install -y ffmpeg
 
 COPY requirements.txt .
 
-# FIX: requirements se pehle yt-dlp ka latest nightly build forcefully install hoga
-RUN pip install --no-cache-dir -U https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt_dlp-nightly.tar.gz
+# FIX: PyPI ke official channels se official master version install hoga (No 404 Error)
+RUN pip install --no-cache-dir -U yt-dlp
 
 # Aapki baki saari requirements (FastAPI, Uvicorn, etc.) yahan install hongi
 RUN pip install --no-cache-dir -r requirements.txt
