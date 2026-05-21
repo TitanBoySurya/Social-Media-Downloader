@@ -71,7 +71,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "6.7.0"
+    VERSION: str = "6.8.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -347,17 +347,14 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
 
 
 async def resolve_redirect_url(url: str) -> str:
-    """FIX 3: Unrolls shared short links (e.g. Facebook share/v/) via spoofed browser headers."""
+    """FIX 3: Unrolls Facebook and YouTube short redirect sequences smoothly with strict browser emulation."""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
+            "Accept-Language": "en-US,en;q=0.9",
             "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Referer": "https://www.facebook.com/"
+            "Referer": "https://www.facebook.com/",
         }
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
             r = await client.get(url, headers=headers)
@@ -556,9 +553,9 @@ def _build_ydl_common() -> dict[str, Any]:
         "noplaylist": True,
         "geo_bypass": True,
         "socket_timeout": config.SOCKET_TIMEOUT,
-        "retries": 10,
-        "extractor_retries": 10,
-        "fragment_retries": 10,
+        "retries": config.MAX_RETRIES,
+        "extractor_retries": config.MAX_RETRIES,
+        "fragment_retries": config.MAX_RETRIES,
         "file_access_retries": 3,
         "restrictfilenames": True,
         "trim_file_name": 200,
@@ -612,8 +609,8 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
 
     return {
         **base,
-        # FIX 1: Robust fallback adaptive pipeline (bv*+ba/b structural fallback)
-        "format": f"{job.format_id}+bestaudio/{job.format_id}/bv*+ba/b" if job.format_id else "bv*+ba/b",
+        # FIX 1: Robust Adaptive Multi-Fallback Matching Chains (Bypasses Requested Format Error)
+        "format": f"{job.format_id}+bestaudio/{job.format_id}/bestvideo*+bestaudio/best" if job.format_id else "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
     }
 
@@ -962,20 +959,8 @@ async def get_formats(request: Request, req: VideoInfoRequest):
 @app.post("/api/download/start", response_model=JobResponse, status_code=202, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_DOWNLOAD)
 async def start_download(request: Request, req: DownloadRequest):
+    # FIX 1: Cleaned up inline sync format mapping filters to avoid premature parsing drops
     resolved_url = await resolve_redirect_url(req.url)
-    
-    opts = _build_ydl_common()
-    if req.format_id:
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(resolved_url, download=False)
-                available_formats = {f.get("format_id") for f in info.get("formats", []) if f.get("format_id")}
-                if req.format_id not in available_formats:
-                    logger.warning(f"Requested format {req.format_id} went stale. Dropping to robust auto-fallback context.")
-                    req.format_id = ""
-        except Exception as exc:
-            logger.warning(f"Pre-download format matching validation bypassed natively: {exc}")
-
     job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
