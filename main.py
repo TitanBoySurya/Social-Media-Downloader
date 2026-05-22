@@ -347,7 +347,7 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
 
 
 async def resolve_redirect_url(url: str) -> str:
-    """FIX: Unrolls shared redirect links safely via spoofed native browser parameters."""
+    """FIX: Unrolls short link redirect sequences smoothly with strict browser emulation."""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -609,7 +609,7 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
 
     return {
         **base,
-        # FIX: Force dynamic matching hierarchy format query chain layout to eliminate "format not available" error.
+        # Upgraded safe cascade pipeline layout sequence mapping chains
         "format": f"{job.format_id}+bestaudio/{job.format_id}/bestvideo*+bestaudio/best" if job.format_id else "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
     }
@@ -960,7 +960,6 @@ async def get_formats(request: Request, req: VideoInfoRequest):
 @app.post("/api/download/start", response_model=JobResponse, status_code=202, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_DOWNLOAD)
 async def start_download(request: Request, req: DownloadRequest):
-    # FIX: Cleaned up inline sync format mapping loops completely to avoid premature extraction drop errors.
     resolved_url = await resolve_redirect_url(req.url)
     job_id = str(uuid.uuid4())
     job = Job(
@@ -1048,7 +1047,7 @@ async def get_file(job_id: str, token: str, request: Request):
         await asyncio.sleep(config.STREAM_PURGE_DELAY_SEC)
         async with _job_store_lock:
             _job_store.pop(job_id, None)
-        cleanup_path(cleanup_path(filepath.parent))
+        cleanup_path(filepath.parent)
 
     return StreamingResponse(
         iter_file_range(filepath, start, end),
