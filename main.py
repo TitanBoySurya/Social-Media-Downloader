@@ -74,7 +74,7 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "7.1.0"
+    VERSION: str = "7.2.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
@@ -395,7 +395,7 @@ async def resolve_redirect_url(url: str) -> str:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15, verify=False) as client:
             r = await client.get(url, headers=headers)
             resolved = str(r.url)
 
@@ -404,10 +404,29 @@ async def resolve_redirect_url(url: str) -> str:
             logger.warning(f"Redirect hit CAPTCHA wall, using original: {url}")
             return url
 
-        # If Facebook share resolved back to a login wall, keep original
-        if is_fb_share and "login" in resolved:
-            logger.warning(f"Facebook share redirect hit login wall, using original: {url}")
-            return url
+        # Facebook share: if it didn't redirect to a real video URL, try to extract
+        # the video ID from the page content
+        if is_fb_share:
+            if "login" in resolved or resolved == url:
+                # Try to extract fb video URL from page source
+                try:
+                    page_text = r.text
+                    # Look for reel or video URL patterns in the page
+                    for pattern in [
+                        r'"(https://www\.facebook\.com/(?:reel|watch|video)[^"]+)"',
+                        r'"(https://www\.facebook\.com/[^"]+/videos/[^"]+)"',
+                        r'content="(https://www\.facebook\.com/[^"]+)"',
+                    ]:
+                        match = re.search(pattern, page_text)
+                        if match:
+                            candidate = match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+                            if "video" in candidate or "reel" in candidate or "watch" in candidate:
+                                logger.info(f"Extracted Facebook video URL from page: {candidate}")
+                                return candidate
+                except Exception as ex:
+                    logger.warning(f"FB page extraction failed: {ex}")
+                logger.warning(f"Facebook share URL could not be resolved, passing as-is: {url}")
+                return url
 
         logger.info(f"Resolved: {url} -> {resolved}")
         return resolved
@@ -618,6 +637,9 @@ def _build_ydl_common() -> dict[str, Any]:
         "sleep_interval": 2,
         "max_sleep_interval": 5,
         "clean_infojson": True,
+        # FIX: Render's network uses an intercepting proxy with self-signed certs
+        # This causes SSL verification to fail — nocheckcertificate is required
+        "nocheckcertificate": True,
         "prefer_insecure": False,
         "http_headers": {
             "User-Agent": _pick_user_agent(),
