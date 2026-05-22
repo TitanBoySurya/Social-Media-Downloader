@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import hmac
 import ipaddress
-import json
 import logging
 import mimetypes
 import os
@@ -54,6 +53,10 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.background import BackgroundTask
 
+# Windows event loop fix (must be before anything else async)
+if os.name == "nt":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # ═══════════════════════════════════════════════════════════
 # CONFIGURATION MANAGEMENT
 # ═══════════════════════════════════════════════════════════
@@ -71,11 +74,12 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 class Config:
     APP_NAME: str = os.getenv("APP_NAME", "VideoSnap API")
-    VERSION: str = "7.0.0"
+    VERSION: str = "7.1.0"
 
     PORT: int = int(os.getenv("PORT", "8000"))
     DEBUG: bool = _env_bool("DEBUG")
-    WORKERS: int = int(os.getenv("WORKERS", "1"))
+    # Always 1 worker — in-memory job store breaks with multiple workers
+    WORKERS: int = 1
 
     DOWNLOAD_DIR: Path = Path(
         os.getenv("DOWNLOAD_DIR", str(Path(__file__).parent / "downloads"))
@@ -95,7 +99,7 @@ class Config:
 
     MAX_FILESIZE_MB: int = int(os.getenv("MAX_FILESIZE_MB", "500"))
     MAX_DURATION_SEC: int = int(os.getenv("MAX_DURATION_SEC", "3600"))
-    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "10"))
+    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
     SOCKET_TIMEOUT: int = int(os.getenv("SOCKET_TIMEOUT", "30"))
     CONCURRENT_FRAGS: int = int(os.getenv("CONCURRENT_FRAGS", "4"))
 
@@ -126,7 +130,7 @@ config = Config()
 config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ═══════════════════════════════════════════════════════════
-# UNIFIED PRODUCTION LOGGING ENGINE
+# LOGGING
 # ═══════════════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -141,7 +145,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════════
-# COOKIES RESOLUTION & SANITIZATION LAYER
+# COOKIES RESOLUTION
 # ═══════════════════════════════════════════════════════════
 
 _COOKIE_CANDIDATE_PATHS = [
@@ -153,7 +157,6 @@ _COOKIE_CANDIDATE_PATHS = [
 
 
 def _resolve_cookies_file() -> str:
-    """Scan and return first valid Netscape-format cookies file."""
     for path in _COOKIE_CANDIDATE_PATHS:
         try:
             if not path:
@@ -161,14 +164,11 @@ def _resolve_cookies_file() -> str:
             p = Path(path)
             if not p.is_file():
                 continue
-
             with p.open("r", encoding="utf-8", errors="ignore") as f:
                 first_line = f.readline().strip()
-
             if "Netscape" not in first_line and "# Netscape" not in first_line:
                 logger.warning(f"Skipping invalid cookies file (not Netscape format): {path}")
                 continue
-
             return str(p)
         except Exception as exc:
             logger.warning(f"Failed checking cookies file [{path}]: {exc}")
@@ -183,11 +183,11 @@ if _original_cookie_file:
         writable_cookie_path = Path(tempfile.gettempdir()) / f"videosnap_cookies_{os.getpid()}.txt"
         shutil.copy2(_original_cookie_file, writable_cookie_path)
         RESOLVED_COOKIES_FILE = str(writable_cookie_path)
-        logger.info(f"Using sanitized writable cookies path: {RESOLVED_COOKIES_FILE}")
+        logger.info(f"Using cookies path: {RESOLVED_COOKIES_FILE}")
     except Exception as exc:
-        logger.error(f"Failed to prepare cookies file sandbox path: {exc}")
+        logger.error(f"Failed to prepare cookies sandbox: {exc}")
 else:
-    logger.warning("No valid Netscape-format cookies.txt found. App processing without credentials.")
+    logger.warning("No valid cookies.txt found — running without credentials.")
 
 # ═══════════════════════════════════════════════════════════
 # ERROR TAXONOMY
@@ -220,7 +220,7 @@ def api_error(status: int, code: ErrorCode, message: str, *, detail: Any = None)
 
 
 # ═══════════════════════════════════════════════════════════
-# METRICS SYSTEM
+# METRICS
 # ═══════════════════════════════════════════════════════════
 
 
@@ -284,12 +284,13 @@ class Job:
 _job_store: dict[str, Job] = {}
 _job_store_lock = asyncio.Lock()
 
-_download_semaphore: asyncio.Semaphore
+# Initialized in lifespan
+_download_semaphore: asyncio.Semaphore | None = None
 _running_tasks: dict[str, asyncio.Task] = {}
 _shutdown_event = asyncio.Event()
 
 # ═══════════════════════════════════════════════════════════
-# SECURITY & REDIRECT RESOLVER UTILITIES
+# SECURITY & URL UTILITIES
 # ═══════════════════════════════════════════════════════════
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -302,7 +303,8 @@ async def require_api_key(api_key: str = Security(_api_key_header)) -> None:
     if not api_key or not secrets.compare_digest(api_key, config.API_KEY):
         prom_errors.labels(code=ErrorCode.UNAUTHORIZED).inc()
         raise HTTPException(
-            status_code=401, detail={"error": "Invalid or missing API key", "code": ErrorCode.UNAUTHORIZED}
+            status_code=401,
+            detail={"error": "Invalid or missing API key", "code": ErrorCode.UNAUTHORIZED},
         )
 
 
@@ -317,17 +319,14 @@ def _verify_token(token: str) -> str:
     try:
         parts = token.split(".")
         if len(parts) != 3:
-            raise ValueError
-
+            raise ValueError("bad format")
         job_id, expires_str, sig = parts
         payload = f"{job_id}.{expires_str}"
         expected = hmac.new(config.TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
         if not hmac.compare_digest(sig, expected):
             raise api_error(401, ErrorCode.INVALID_TOKEN, "Invalid token")
         if int(time.time()) > int(expires_str):
             raise api_error(401, ErrorCode.TOKEN_EXPIRED, "Token expired")
-
         return job_id
     except HTTPException:
         raise
@@ -335,8 +334,7 @@ def _verify_token(token: str) -> str:
         raise api_error(401, ErrorCode.INVALID_TOKEN, "Malformed token")
 
 
-def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
-    """Resolve host IPs within an explicit runtime timeout threshold."""
+def _resolve_host_safe(host: str, timeout: float = 5.0) -> list:
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(socket.getaddrinfo, host, None)
@@ -346,22 +344,57 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list[str]:
             raise ValueError(f"DNS resolution timed out for host: {host}")
 
 
+# FIX: resolve_redirect_url now skips the httpx GET for YouTube/Instagram/TikTok
+# domains where following redirects causes Google CAPTCHA loops.
+# For short links (bit.ly, youtu.be etc.) it still follows redirects but
+# aborts if the resolved URL lands on google.com/sorry (CAPTCHA wall).
+_SKIP_REDIRECT_DOMAINS = {
+    "youtube.com", "www.youtube.com",
+    "instagram.com", "www.instagram.com",
+    "tiktok.com", "www.tiktok.com",
+    "twitter.com", "www.twitter.com",
+    "x.com", "www.x.com",
+    "facebook.com", "www.facebook.com",
+    "fb.com", "www.fb.com",
+}
+
+
 async def resolve_redirect_url(url: str) -> str:
-    """FIX: Unrolls short link redirect sequences smoothly with strict browser emulation."""
+    """
+    Unrolls short-link redirects (youtu.be, bit.ly, etc.).
+    Skips HTTP fetch for direct platform URLs to avoid Google CAPTCHA traps.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().lstrip("www.")
+
+    # Direct platform URL — no redirect needed, yt-dlp handles it natively
+    if parsed.hostname and parsed.hostname.lower() in _SKIP_REDIRECT_DOMAINS:
+        logger.debug(f"Skipping redirect resolution for direct platform URL: {url}")
+        return url
+
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Mode": "navigate",
-            "Referer": "https://www.facebook.com/",
         }
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
             r = await client.get(url, headers=headers)
-            logger.info(f"URL Resolved from link extraction sequence: {r.url}")
-            return str(r.url)
+            resolved = str(r.url)
+
+        # Abort if we landed on a CAPTCHA / sorry page
+        if "google.com/sorry" in resolved or "accounts.google.com" in resolved:
+            logger.warning(f"Redirect resolution hit CAPTCHA wall, using original URL: {url}")
+            return url
+
+        logger.info(f"Resolved redirect: {url} -> {resolved}")
+        return resolved
     except Exception as e:
-        logger.warning(f"Redirect resolver extraction failed for {url}: {e}")
+        logger.warning(f"Redirect resolution failed for {url}: {e}")
         return url
 
 
@@ -369,30 +402,28 @@ def validate_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Only HTTP/HTTPS URLs are allowed")
-
     host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
-        raise ValueError("Empty host in URL target configuration parameters.")
+        raise ValueError("Empty host in URL")
     if host in config.BLOCKED_HOSTS:
-        raise ValueError(f"Blocked host network route: {host}")
-
+        raise ValueError(f"Blocked host: {host}")
     try:
         addr_info = _resolve_host_safe(host)
         for res in addr_info:
             ip_str = res[4][0]
             ip = ipaddress.ip_address(ip_str)
             if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local:
-                raise ValueError(f"Private/reserved infrastructure host interface blocked: {ip_str}")
+                raise ValueError(f"Private/reserved IP blocked: {ip_str}")
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError(f"Host execution router compilation routing failed: {exc}") from exc
-
+        raise ValueError(f"Host validation failed: {exc}") from exc
     return url
 
 
 def url_cache_key(url: str) -> str:
     return hashlib.sha256(url.strip().lower().encode()).hexdigest()
+
 
 # ═══════════════════════════════════════════════════════════
 # FILE UTILITIES
@@ -407,10 +438,12 @@ def cleanup_path(path: str | Path) -> None:
         elif p.is_file():
             p.unlink(missing_ok=True)
     except Exception as exc:
-        logger.warning(f"Cleanup engine drop routine failure context: {path}: {exc}")
+        logger.warning(f"Cleanup failed for {path}: {exc}")
 
 
-async def iter_file_range(filepath: Path, start: int, end: int, chunk_size: int = config.CHUNK_SIZE) -> AsyncGenerator[bytes, None]:
+async def iter_file_range(
+    filepath: Path, start: int, end: int, chunk_size: int = config.CHUNK_SIZE
+) -> AsyncGenerator[bytes, None]:
     loop = asyncio.get_running_loop()
     remaining = end - start + 1
     with filepath.open("rb") as fh:
@@ -504,7 +537,7 @@ class JobStatusResponse(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# YT-DLP CORE ADVANCED IMPLEMENTATION
+# YT-DLP CORE
 # ═══════════════════════════════════════════════════════════
 
 QUALITY_ORDER = {"8K": 0, "4K": 1, "2K": 2, "1080p": 3, "720p": 4, "480p": 5, "360p": 6, "audio": 7}
@@ -525,21 +558,23 @@ ANTI_BOT_PATTERNS = [
 
 
 def _pick_user_agent() -> str:
-    idx = int(time.time() / 60) % len(_USER_AGENTS)
-    return _USER_AGENTS[idx]
+    return _USER_AGENTS[int(time.time() / 60) % len(_USER_AGENTS)]
 
 
 def _build_ydl_common() -> dict[str, Any]:
+    # FIX: Removed "skip": ["hls", "dash"] — that was blocking YouTube's primary streams.
+    # FIX: Reduced player_client list to the two most stable clients.
+    # FIX: Removed youtube_include_dash_manifest / youtube_include_hls_manifest —
+    #      they conflict with android client and are controlled by yt-dlp automatically.
     extractor_args: dict[str, Any] = {
         "youtube": {
-            "player_client": ["android", "web", "tv_embedded", "ios"],
+            "player_client": ["android", "web"],
             "player_skip": ["configs"],
-            "skip": ["hls", "dash"]
         },
         "facebook": {
             "api": "graphql",
-            "format": "hd"
-        }
+            "format": "hd",
+        },
     }
 
     if config.YT_PO_TOKEN and config.YT_VISITOR_DATA:
@@ -564,20 +599,12 @@ def _build_ydl_common() -> dict[str, Any]:
         "sleep_interval_requests": 1,
         "sleep_interval": 2,
         "max_sleep_interval": 5,
-        "youtube_include_dash_manifest": True,
-        "youtube_include_hls_manifest": True,
         "clean_infojson": True,
         "prefer_insecure": False,
-        "default_search": "auto",
-        "compat_opts": {
-            "manifest-filesize-approx",
-        },
         "http_headers": {
             "User-Agent": _pick_user_agent(),
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Mode": "navigate",
-            "Referer": "https://www.facebook.com/",
         },
     }
 
@@ -603,14 +630,31 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
             **base,
             "format": "bestaudio/best",
             "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": job.audio_format, "preferredquality": "0"}
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": job.audio_format,
+                    "preferredquality": "0",
+                }
             ],
         }
 
+    # FIX: Safer format selector chain.
+    # bv*+ba = best video + best audio (merges)
+    # bv+ba  = fallback without wildcard
+    # b      = single-file best (no merge needed)
+    if job.format_id:
+        fmt = (
+            f"{job.format_id}+ba"     # requested format + best audio
+            f"/{job.format_id}+bestaudio"
+            f"/{job.format_id}"       # requested format alone (if it has audio)
+            "/bv*+ba/bv+ba/b"         # full fallback chain
+        )
+    else:
+        fmt = "bv*+ba/bv+ba/b"
+
     return {
         **base,
-        # Upgraded safe cascade pipeline layout sequence mapping chains
-        "format": f"{job.format_id}+bestaudio/{job.format_id}/bestvideo*+bestaudio/best" if job.format_id else "bestvideo*+bestaudio/best",
+        "format": fmt,
         "merge_output_format": "mp4",
     }
 
@@ -622,11 +666,9 @@ def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
             continue
         if fmt.get("protocol") == "m3u8_native":
             continue
-
         vcodec = fmt.get("vcodec", "none")
         if vcodec == "none" and fmt.get("acodec") == "none":
             continue
-
         height = fmt.get("height") or 0
         out.append(
             FormatInfo(
@@ -636,7 +678,7 @@ def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
                 filesize=fmt.get("filesize"),
                 filesize_approx=fmt.get("filesize_approx"),
                 is_audio=bool(vcodec == "none"),
-                resolution=f'{fmt.get("width")}x{height}' if height else "Adaptive Stream",
+                resolution=f'{fmt.get("width")}x{height}' if height else "Adaptive",
                 fps=fmt.get("fps"),
                 tbr=fmt.get("tbr"),
                 vcodec=vcodec,
@@ -658,26 +700,23 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
             raise api_error(
                 403,
                 ErrorCode.FETCH_FAILED,
-                "YouTube bot detection triggered. Valid cookies configuration required.",
-                detail={
-                    "hint": "Export Netscape formatted cookies mapping directly onto Render configuration volumes.",
-                    "cookies_loaded": bool(RESOLVED_COOKIES_FILE),
-                },
+                "YouTube bot detection triggered. Valid cookies required.",
+                detail={"cookies_loaded": bool(RESOLVED_COOKIES_FILE)},
             )
         if "Private video" in err_str:
-            raise api_error(403, ErrorCode.FETCH_FAILED, "Requested resource state is private.")
+            raise api_error(403, ErrorCode.FETCH_FAILED, "Video is private.")
         if "This video is not available" in err_str:
-            raise api_error(404, ErrorCode.FETCH_FAILED, "Resource restrictions applied at location region.")
-        raise api_error(400, ErrorCode.FETCH_FAILED, f"Extraction interface parsing exception: {exc}")
+            raise api_error(404, ErrorCode.FETCH_FAILED, "Video not available in this region.")
+        raise api_error(400, ErrorCode.FETCH_FAILED, f"Extraction failed: {exc}")
     except Exception as exc:
-        raise api_error(400, ErrorCode.FETCH_FAILED, f"Extraction framework crash context: {exc}")
+        raise api_error(400, ErrorCode.FETCH_FAILED, f"Unexpected error: {exc}")
 
     if not info or not info.get("formats"):
-        raise api_error(400, ErrorCode.FETCH_FAILED, "No downloadable formats available on destination stream.")
+        raise api_error(400, ErrorCode.FETCH_FAILED, "No downloadable formats found.")
 
     duration = info.get("duration") or 0
     if duration > config.MAX_DURATION_SEC:
-        raise api_error(400, ErrorCode.DURATION_EXCEEDED, "Resource runtime bounds validation exceeded.")
+        raise api_error(400, ErrorCode.DURATION_EXCEEDED, "Video exceeds maximum allowed duration.")
 
     return VideoInfo(
         title=info.get("title", "Unknown"),
@@ -689,12 +728,19 @@ def fetch_video_info_sync(url: str) -> VideoInfo:
         webpage_url=url,
     )
 
+
 # ═══════════════════════════════════════════════════════════
-# DOWNLOAD ENGINE PIPELINES
+# DOWNLOAD ENGINE
 # ═══════════════════════════════════════════════════════════
 
 
 async def run_download_job(job_id: str) -> None:
+    global _download_semaphore
+
+    # Safety net if semaphore wasn't set in lifespan
+    if _download_semaphore is None:
+        _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
+
     async with _job_store_lock:
         job = _job_store.get(job_id)
         if not job:
@@ -710,33 +756,28 @@ async def run_download_job(job_id: str) -> None:
     def _progress_hook(d: dict) -> None:
         if d.get("status") != "downloading":
             return
-
         total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         downloaded = d.get("downloaded_bytes", 0)
         pct = downloaded / total * 100 if total else 0.0
-
-        speed = d.get("speed")
-        eta = d.get("eta")
 
         async def _update() -> None:
             async with _job_store_lock:
                 if job_id not in _job_store:
                     return
                 job.progress = round(pct, 1)
-                job.speed_bps = speed
-                job.eta_sec = eta
+                job.speed_bps = d.get("speed")
+                job.eta_sec = d.get("eta")
                 job.updated_at = datetime.now(UTC).isoformat()
 
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_update())
+            asyncio.get_running_loop().create_task(_update())
         except RuntimeError:
             pass
 
     try:
-        total_b, used_b, free_b = shutil.disk_usage(config.DOWNLOAD_DIR)
+        _, _, free_b = shutil.disk_usage(config.DOWNLOAD_DIR)
         if free_b < (config.MAX_FILESIZE_MB * 1024 * 1024):
-            raise OSError("Allocation overflow exception on active storage volume mount.")
+            raise OSError("Insufficient disk space for download.")
 
         opts = _build_download_opts(job, str(out_dir / "%(title)s.%(ext)s"))
         opts["progress_hooks"] = [_progress_hook]
@@ -748,16 +789,22 @@ async def run_download_job(job_id: str) -> None:
         async with _download_semaphore:
             if _shutdown_event.is_set():
                 raise asyncio.CancelledError()
-            await asyncio.wait_for(asyncio.to_thread(_blocking_download), timeout=config.DOWNLOAD_TIMEOUT_SEC)
+            await asyncio.wait_for(
+                asyncio.to_thread(_blocking_download),
+                timeout=config.DOWNLOAD_TIMEOUT_SEC,
+            )
 
         files = sorted(
-            [f for f in out_dir.iterdir() if f.suffix in {".mp4", ".mp3", ".mkv", ".webm", ".m4a", ".opus", ".flac", ".wav"}],
+            [
+                f for f in out_dir.iterdir()
+                if f.suffix in {".mp4", ".mp3", ".mkv", ".webm", ".m4a", ".opus", ".flac", ".wav"}
+            ],
             key=lambda f: f.stat().st_mtime,
             reverse=True,
         )
 
         if not files:
-            raise FileNotFoundError("Storage allocation target tracking missing from path indices.")
+            raise FileNotFoundError("No output file found after download.")
 
         chosen = files[0]
         prom_dl_bytes.inc(chosen.stat().st_size)
@@ -779,19 +826,25 @@ async def run_download_job(job_id: str) -> None:
         async with _job_store_lock:
             if job_id in _job_store:
                 job.status = JobStatus.CANCELLED
-                job.error = "Job compilation terminated via user cancel thread event."
+                job.error = "Job was cancelled."
+                job.expires_at = (datetime.now(UTC) + timedelta(seconds=config.JOB_TTL_SEC)).isoformat()
         cleanup_path(out_dir)
+
     except Exception as exc:
         err_msg = str(exc)
         async with _job_store_lock:
             if job_id in _job_store:
                 job.status = JobStatus.FAILED
-                if any(p.lower() in err_msg.lower() for p in ANTI_BOT_PATTERNS):
-                    job.error = "YouTube verification requested: anti-bot engine pipeline intercept triggered."
-                else:
-                    job.error = err_msg
+                job.error = (
+                    "YouTube bot detection triggered — cookies required."
+                    if any(p.lower() in err_msg.lower() for p in ANTI_BOT_PATTERNS)
+                    else err_msg
+                )
+                # FIX: Failed jobs now also get expires_at so cleanup works
+                job.expires_at = (datetime.now(UTC) + timedelta(seconds=config.JOB_TTL_SEC)).isoformat()
         cleanup_path(out_dir)
         prom_errors.labels(code=ErrorCode.INTERNAL_ERROR).inc()
+
     finally:
         prom_active_jobs.dec()
         _running_tasks.pop(job_id, None)
@@ -801,14 +854,12 @@ async def _cleanup_scheduler():
     while not _shutdown_event.is_set():
         await asyncio.sleep(config.CLEANUP_INTERVAL)
         now = datetime.now(UTC)
-
         async with _job_store_lock:
             expired = [
                 jid
                 for jid, job in _job_store.items()
                 if job.expires_at and datetime.fromisoformat(job.expires_at) < now
             ]
-
             for jid in expired:
                 job = _job_store.get(jid)
                 if job and not job.is_streaming:
@@ -823,13 +874,13 @@ async def lifespan(app: FastAPI):
     _download_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
 
     if not shutil.which("ffmpeg"):
-        logger.error("FATAL INSTANTIATION ERROR: ffmpeg binary engine unallocated inside server context.")
-        raise RuntimeError("ffmpeg execution context missing. Add binaries to continuous path environments.")
+        logger.error("ffmpeg not found — required for merging video+audio streams.")
+        raise RuntimeError("ffmpeg not found. Install ffmpeg and ensure it is on PATH.")
 
-    logger.info(f"Starting Engine Interface Router {config.APP_NAME} v{config.VERSION}")
-    logger.info(f"Core engine library version fingerprint -> yt-dlp: {yt_dlp.version.__version__}")
-    logger.info(f"Target tracking partition space allocation mapping initialized path: {RESOLVED_COOKIES_FILE or '(none)'}")
-    
+    logger.info(f"Starting {config.APP_NAME} v{config.VERSION}")
+    logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+    logger.info(f"Cookies: {RESOLVED_COOKIES_FILE or '(none)'}")
+
     cleanup_task = asyncio.create_task(_cleanup_scheduler())
     yield
     _shutdown_event.set()
@@ -837,8 +888,9 @@ async def lifespan(app: FastAPI):
     for task in list(_running_tasks.values()):
         task.cancel()
 
+
 # ═══════════════════════════════════════════════════════════
-# FASTAPI INSTANTIATION ENGINE
+# FASTAPI APP
 # ═══════════════════════════════════════════════════════════
 
 app = FastAPI(title=config.APP_NAME, version=config.VERSION, lifespan=lifespan)
@@ -867,13 +919,16 @@ async def request_id_middleware(request: Request, call_next):
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(status_code=429, content={"error": "Rate limit exceeded", "code": ErrorCode.RATE_LIMITED})
+    return JSONResponse(
+        status_code=429,
+        content={"error": "Rate limit exceeded", "code": ErrorCode.RATE_LIMITED},
+    )
 
 
 _auth = Depends(require_api_key)
 
 # ═══════════════════════════════════════════════════════════
-# ENDPOINT INVOCATION CONTROLLERS
+# ENDPOINTS
 # ═══════════════════════════════════════════════════════════
 
 
@@ -884,7 +939,6 @@ async def health():
         "version": config.VERSION,
         "timestamp": datetime.now(UTC).isoformat(),
         "cookies_loaded": bool(RESOLVED_COOKIES_FILE),
-        "cookies_path": RESOLVED_COOKIES_FILE or None,
         "ffmpeg_available": bool(shutil.which("ffmpeg")),
     }
 
@@ -898,8 +952,12 @@ async def metrics():
 @limiter.limit(config.RATE_LIMIT_INFO)
 async def get_info(request: Request, req: VideoInfoRequest, response: Response):
     resolved_url = await resolve_redirect_url(req.url)
-    key = url_cache_key(resolved_url)
-    
+    try:
+        clean_url = validate_url(resolved_url)
+    except ValueError as exc:
+        raise api_error(400, ErrorCode.INVALID_URL, str(exc))
+
+    key = url_cache_key(clean_url)
     async with cache_lock:
         if key in video_info_cache:
             prom_cache_hits.inc()
@@ -907,9 +965,11 @@ async def get_info(request: Request, req: VideoInfoRequest, response: Response):
             return video_info_cache[key]
 
     try:
-        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, resolved_url), timeout=30.0)
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0
+        )
     except asyncio.TimeoutError:
-        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata fetch timed out.")
 
     async with cache_lock:
         video_info_cache[key] = info
@@ -919,7 +979,11 @@ async def get_info(request: Request, req: VideoInfoRequest, response: Response):
 
 @app.get("/api/info", response_model=VideoInfo, dependencies=[_auth])
 @limiter.limit(config.RATE_LIMIT_INFO)
-async def get_info_browser(request: Request, url: str = Query(..., min_length=10, max_length=2048), response: Response = None):
+async def get_info_browser(
+    request: Request,
+    url: str = Query(..., min_length=10, max_length=2048),
+    response: Response = None,
+):
     resolved_url = await resolve_redirect_url(url)
     try:
         clean_url = validate_url(resolved_url)
@@ -935,9 +999,11 @@ async def get_info_browser(request: Request, url: str = Query(..., min_length=10
             return video_info_cache[key]
 
     try:
-        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0)
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0
+        )
     except asyncio.TimeoutError:
-        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata fetch timed out.")
 
     async with cache_lock:
         video_info_cache[key] = info
@@ -951,9 +1017,16 @@ async def get_info_browser(request: Request, url: str = Query(..., min_length=10
 async def get_formats(request: Request, req: VideoInfoRequest):
     resolved_url = await resolve_redirect_url(req.url)
     try:
-        info = await asyncio.wait_for(asyncio.to_thread(fetch_video_info_sync, resolved_url), timeout=30.0)
+        clean_url = validate_url(resolved_url)
+    except ValueError as exc:
+        raise api_error(400, ErrorCode.INVALID_URL, str(exc))
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(fetch_video_info_sync, clean_url), timeout=30.0
+        )
     except asyncio.TimeoutError:
-        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata query timed out.")
+        raise api_error(408, ErrorCode.DOWNLOAD_TIMEOUT, "Metadata fetch timed out.")
     return info.formats
 
 
@@ -961,10 +1034,16 @@ async def get_formats(request: Request, req: VideoInfoRequest):
 @limiter.limit(config.RATE_LIMIT_DOWNLOAD)
 async def start_download(request: Request, req: DownloadRequest):
     resolved_url = await resolve_redirect_url(req.url)
+    # FIX: validate_url was missing from download/start — SSRF gap
+    try:
+        clean_url = validate_url(resolved_url)
+    except ValueError as exc:
+        raise api_error(400, ErrorCode.INVALID_URL, str(exc))
+
     job_id = str(uuid.uuid4())
     job = Job(
         job_id=job_id,
-        url=resolved_url,
+        url=clean_url,
         is_audio=req.is_audio,
         format_id=req.format_id,
         audio_format=req.audio_format,
@@ -977,22 +1056,33 @@ async def start_download(request: Request, req: DownloadRequest):
     task = asyncio.create_task(run_download_job(job_id))
     _running_tasks[job_id] = task
 
-    return JobResponse(job_id=job_id, status=JobStatus.PENDING, message="Job enqueued", poll_url=f"/api/download/status/{job_id}")
+    return JobResponse(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        message="Job enqueued",
+        poll_url=f"/api/download/status/{job_id}",
+    )
 
 
 @app.get("/api/download/status/{job_id}", response_model=JobStatusResponse, dependencies=[_auth])
 async def download_status(job_id: str):
     async with _job_store_lock:
         job = _job_store.get(job_id)
-
     if not job:
         raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
     token = _make_token(job_id) if job.status == JobStatus.DONE else None
-
     return JobStatusResponse(
-        job_id=job_id, status=job.status, filename=job.safe_name, error=job.error, progress=job.progress,
-        speed_bps=job.speed_bps, eta_sec=job.eta_sec, download_token=token, created_at=job.created_at,
-        updated_at=job.updated_at, expires_at=job.expires_at,
+        job_id=job_id,
+        status=job.status,
+        filename=job.safe_name,
+        error=job.error,
+        progress=job.progress,
+        speed_bps=job.speed_bps,
+        eta_sec=job.eta_sec,
+        download_token=token,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        expires_at=job.expires_at,
     )
 
 
@@ -1000,7 +1090,7 @@ async def download_status(job_id: str):
 async def get_file(job_id: str, token: str, request: Request):
     verified_job_id = _verify_token(token)
     if verified_job_id != job_id:
-        raise api_error(401, ErrorCode.INVALID_TOKEN, "Invalid token")
+        raise api_error(401, ErrorCode.INVALID_TOKEN, "Token/job mismatch")
 
     async with _job_store_lock:
         job_obj = _job_store.get(job_id)
@@ -1012,22 +1102,27 @@ async def get_file(job_id: str, token: str, request: Request):
 
     filepath = Path(job_obj.filename) if job_obj.filename else None
     if not filepath or not filepath.is_file():
-        raise api_error(404, ErrorCode.FILE_MISSING, "File missing")
+        raise api_error(404, ErrorCode.FILE_MISSING, "File not found on disk")
 
     file_size = filepath.stat().st_size
-    media_type = f"audio/{job_obj.audio_format}" if job_obj.is_audio else (mimetypes.guess_type(str(filepath))[0] or "video/mp4")
+    media_type = (
+        f"audio/{job_obj.audio_format}"
+        if job_obj.is_audio
+        else (mimetypes.guess_type(str(filepath))[0] or "video/mp4")
+    )
 
     range_header = request.headers.get("Range")
     start, end = 0, file_size - 1
 
     if range_header:
-        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        # FIX: Anchored regex to avoid partial matches
+        match = re.match(r"^bytes=(\d+)-(\d*)$", range_header)
         if match:
             start = int(match.group(1))
             end = int(match.group(2)) if match.group(2) else file_size - 1
             end = min(end, file_size - 1)
             if start >= file_size or start > end:
-                raise HTTPException(status_code=416, detail="Invalid range")
+                raise HTTPException(status_code=416, detail="Range not satisfiable")
 
     content_length = end - start + 1
     is_partial = start > 0 or end < file_size - 1
@@ -1043,10 +1138,25 @@ async def get_file(job_id: str, token: str, request: Request):
     async with _job_store_lock:
         job_obj.is_streaming = True
 
-    async def purge_after_stream():
+    # FIX: BackgroundTask cannot run coroutines directly.
+    # We use a sync wrapper that schedules the async cleanup on the event loop.
+    def _sync_purge():
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(_async_purge())
+            else:
+                loop.run_until_complete(_async_purge())
+        except Exception as exc:
+            logger.warning(f"Purge scheduling error: {exc}")
+
+    async def _async_purge():
         await asyncio.sleep(config.STREAM_PURGE_DELAY_SEC)
         async with _job_store_lock:
-            _job_store.pop(job_id, None)
+            existing = _job_store.get(job_id)
+            if existing:
+                existing.is_streaming = False
+                _job_store.pop(job_id, None)
         cleanup_path(filepath.parent)
 
     return StreamingResponse(
@@ -1054,7 +1164,7 @@ async def get_file(job_id: str, token: str, request: Request):
         status_code=206 if is_partial else 200,
         media_type=media_type,
         headers=headers,
-        background=BackgroundTask(purge_after_stream),
+        background=BackgroundTask(_sync_purge),
     )
 
 
@@ -1064,16 +1174,15 @@ async def cancel_job(job_id: str):
         job = _job_store.get(job_id)
         if not job:
             raise api_error(404, ErrorCode.JOB_NOT_FOUND, "Job not found")
-
         task = _running_tasks.get(job_id)
         if task and not task.done():
             task.cancel()
-
         job.status = JobStatus.CANCELLED
         job.updated_at = datetime.now(UTC).isoformat()
+        job.expires_at = (datetime.now(UTC) + timedelta(seconds=config.JOB_TTL_SEC)).isoformat()
 
     cleanup_path(config.DOWNLOAD_DIR / job_id)
-    return {"message": f"Job [{job_id}] cancelled successfully."}
+    return {"message": f"Job {job_id} cancelled."}
 
 
 if __name__ == "__main__":
@@ -1082,7 +1191,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=config.PORT,
         reload=config.DEBUG,
-        workers=config.WORKERS if not config.DEBUG else 1,
+        workers=1,  # Always 1 — in-memory store breaks with multiple workers
         server_header=False,
         date_header=False,
     )
