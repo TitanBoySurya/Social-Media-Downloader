@@ -350,26 +350,39 @@ def _resolve_host_safe(host: str, timeout: float = 5.0) -> list:
 # aborts if the resolved URL lands on google.com/sorry (CAPTCHA wall).
 _SKIP_REDIRECT_DOMAINS = {
     "youtube.com", "www.youtube.com",
+    "youtu.be",                          # FIX: short links also skip httpx redirect
     "instagram.com", "www.instagram.com",
     "tiktok.com", "www.tiktok.com",
     "twitter.com", "www.twitter.com",
     "x.com", "www.x.com",
     "facebook.com", "www.facebook.com",
     "fb.com", "www.fb.com",
+    "m.facebook.com",
 }
 
 
 async def resolve_redirect_url(url: str) -> str:
     """
-    Unrolls short-link redirects (youtu.be, bit.ly, etc.).
-    Skips HTTP fetch for direct platform URLs to avoid Google CAPTCHA traps.
+    Resolves short-link redirects (bit.ly etc.).
+
+    Rules:
+    - Known platform domains → return as-is; yt-dlp handles them natively
+      and httpx hits Google CAPTCHA walls for YouTube/Facebook.
+    - Facebook /share/ URLs → follow redirect to get the real video URL,
+      since yt-dlp cannot extract from share-redirect URLs.
+    - Everything else → follow redirects, abort if we land on a CAPTCHA page.
     """
     parsed = urlparse(url)
-    host = (parsed.hostname or "").lower().lstrip("www.")
+    hostname = (parsed.hostname or "").lower()
 
-    # Direct platform URL — no redirect needed, yt-dlp handles it natively
-    if parsed.hostname and parsed.hostname.lower() in _SKIP_REDIRECT_DOMAINS:
-        logger.debug(f"Skipping redirect resolution for direct platform URL: {url}")
+    # Facebook /share/ URLs must be resolved — yt-dlp can't handle them
+    is_fb_share = hostname in {"facebook.com", "www.facebook.com", "m.facebook.com"} and (
+        "/share/" in parsed.path or parsed.path.startswith("/share")
+    )
+
+    # Skip redirect fetch for direct platform URLs (not share links)
+    if hostname in _SKIP_REDIRECT_DOMAINS and not is_fb_share:
+        logger.debug(f"Skipping redirect resolution for: {url}")
         return url
 
     try:
@@ -386,12 +399,17 @@ async def resolve_redirect_url(url: str) -> str:
             r = await client.get(url, headers=headers)
             resolved = str(r.url)
 
-        # Abort if we landed on a CAPTCHA / sorry page
+        # Abort if we landed on a CAPTCHA / login wall
         if "google.com/sorry" in resolved or "accounts.google.com" in resolved:
-            logger.warning(f"Redirect resolution hit CAPTCHA wall, using original URL: {url}")
+            logger.warning(f"Redirect hit CAPTCHA wall, using original: {url}")
             return url
 
-        logger.info(f"Resolved redirect: {url} -> {resolved}")
+        # If Facebook share resolved back to a login wall, keep original
+        if is_fb_share and "login" in resolved:
+            logger.warning(f"Facebook share redirect hit login wall, using original: {url}")
+            return url
+
+        logger.info(f"Resolved: {url} -> {resolved}")
         return resolved
     except Exception as e:
         logger.warning(f"Redirect resolution failed for {url}: {e}")
@@ -638,19 +656,20 @@ def _build_download_opts(job: Job, output_template: str) -> dict[str, Any]:
             ],
         }
 
-    # FIX: Safer format selector chain.
-    # bv*+ba = best video + best audio (merges)
-    # bv+ba  = fallback without wildcard
-    # b      = single-file best (no merge needed)
+    # FIX: Format selector with safe pre-merged fallbacks.
+    # bv*+ba, bv+ba  → best video + best audio (requires ffmpeg merge)
+    # b              → best single-file stream (usually 720p/480p with audio)
+    # 18             → YouTube's classic 360p MP4 — always available, no auth needed
+    # 17             → YouTube 144p 3GP — absolute last resort
     if job.format_id:
         fmt = (
-            f"{job.format_id}+ba"     # requested format + best audio
+            f"{job.format_id}+ba"
             f"/{job.format_id}+bestaudio"
-            f"/{job.format_id}"       # requested format alone (if it has audio)
-            "/bv*+ba/bv+ba/b"         # full fallback chain
+            f"/{job.format_id}"
+            "/bv*+ba/bv+ba/b/18/17"
         )
     else:
-        fmt = "bv*+ba/bv+ba/b"
+        fmt = "bv*+ba/bv+ba/b/18/17"
 
     return {
         **base,
@@ -690,7 +709,12 @@ def _parse_formats(raw_formats: list[dict]) -> list[FormatInfo]:
 
 
 def fetch_video_info_sync(url: str) -> VideoInfo:
-    opts = {**_build_ydl_common(), "skip_download": True}
+    opts = {
+        **_build_ydl_common(),
+        "skip_download": True,
+        # Without this, yt-dlp may fail on restricted videos when no cookies present
+        "format": "bv*+ba/bv+ba/b/18/17",
+    }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
